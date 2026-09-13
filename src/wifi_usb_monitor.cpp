@@ -159,20 +159,18 @@ static void wifi_monitor_task(void *) {
     }
 }
 
-// Arduino-ESP32 global constructors run from the Arduino app task after the
-// scheduler exists. Configure the C6 RF switch before setup() starts Wi-Fi,
-// then start the diagnostics task.
-class WiFiUsbMonitorStarter {
-public:
-    WiFiUsbMonitorStarter() {
-        configure_xiao_c6_antenna();
-        xTaskCreate(wifi_monitor_task,
-                    "wifi_mon",
-                    4096,
-                    nullptr,
-                    1,
-                    nullptr);
-    }
-};
+void wifi_usb_monitor_init() {
+    // Called explicitly from setup(), after Arduino/FreeRTOS startup is complete.
+    // Avoid doing GPIO/FreeRTOS work from a global constructor on ESP32-C6.
+    configure_xiao_c6_antenna();
 
-static WiFiUsbMonitorStarter wifi_usb_monitor_starter;
+    BaseType_t ok = xTaskCreate(wifi_monitor_task,
+                                "wifi_mon",
+                                4096,
+                                nullptr,
+                                1,
+                                nullptr);
+    if (ok != pdPASS) {
+        Serial.println("[WIFI-MON] ERROR: failed to start monitor task");
+    }
+}
