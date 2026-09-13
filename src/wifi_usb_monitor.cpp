@@ -11,6 +11,43 @@
 static const uint32_t WIFI_MONITOR_INTERVAL_MS = 5000;
 static const uint32_t WIFI_MONITOR_START_DELAY_MS = 3000;
 
+#if defined(AB_BOARD_XIAO_ESP32C6)
+#ifndef AB_EXTERNAL_ANTENNA
+#define AB_EXTERNAL_ANTENNA 0
+#endif
+
+// Seeed XIAO ESP32-C6 RF switch control:
+// GPIO3 LOW enables software control of the antenna switch.
+// GPIO14 LOW selects the onboard ceramic antenna.
+// GPIO14 HIGH selects the external U.FL antenna.
+static constexpr uint8_t XIAO_C6_RF_SWITCH_ENABLE_GPIO = 3;
+static constexpr uint8_t XIAO_C6_RF_SWITCH_SELECT_GPIO = 14;
+
+static void configure_xiao_c6_antenna() {
+    pinMode(XIAO_C6_RF_SWITCH_ENABLE_GPIO, OUTPUT);
+    digitalWrite(XIAO_C6_RF_SWITCH_ENABLE_GPIO, LOW);
+    delay(10);
+
+    pinMode(XIAO_C6_RF_SWITCH_SELECT_GPIO, OUTPUT);
+#if AB_EXTERNAL_ANTENNA
+    digitalWrite(XIAO_C6_RF_SWITCH_SELECT_GPIO, HIGH);
+#else
+    digitalWrite(XIAO_C6_RF_SWITCH_SELECT_GPIO, LOW);
+#endif
+}
+
+static const char *antenna_name() {
+#if AB_EXTERNAL_ANTENNA
+    return "external-UFL";
+#else
+    return "onboard";
+#endif
+}
+#else
+static void configure_xiao_c6_antenna() {}
+static const char *antenna_name() { return "board-default"; }
+#endif
+
 static const char *mode_name(wifi_mode_t mode) {
     switch (mode) {
         case WIFI_MODE_NULL:   return "NULL";
@@ -84,11 +121,12 @@ static void print_status() {
     wl_status_t wl = WiFi.status();
     bool connected = (wl == WL_CONNECTED);
 
-    Serial.printf("[WIFI-MON] cfg=%s hw=%s state=%s wl=%s",
+    Serial.printf("[WIFI-MON] cfg=%s hw=%s state=%s wl=%s antenna=%s",
                   cfg_mode_name(cfg.wifi_mode),
                   mode_name(hw_mode),
                   WiFiSetup::state_name(),
-                  wl_status_name(wl));
+                  wl_status_name(wl),
+                  antenna_name());
 
     if (connected) {
         Serial.printf(" ssid='%s' rssi=%d dBm ch=%d ip=%s gw=%s",
@@ -122,11 +160,12 @@ static void wifi_monitor_task(void *) {
 }
 
 // Arduino-ESP32 global constructors run from the Arduino app task after the
-// scheduler exists. Starting the diagnostics task here keeps the monitor
-// self-contained and avoids touching the main AirBridge control loop.
+// scheduler exists. Configure the C6 RF switch before setup() starts Wi-Fi,
+// then start the diagnostics task.
 class WiFiUsbMonitorStarter {
 public:
     WiFiUsbMonitorStarter() {
+        configure_xiao_c6_antenna();
         xTaskCreate(wifi_monitor_task,
                     "wifi_mon",
                     4096,
