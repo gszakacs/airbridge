@@ -20,6 +20,7 @@ const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
 
 extern void dispatch_command(const char *line, String &response);
 extern void wifi_usb_monitor_init();
+extern void wifi_usb_monitor_tick();
 
 #define SERIAL_LINE_MAX 256
 static char serial_line[SERIAL_LINE_MAX];
@@ -176,7 +177,7 @@ void setup() {
     while (Serial.available()) Serial.read();  // flush boot garbage
     Log::init();
 
-    // Start USB Wi-Fi diagnostics only after Arduino/FreeRTOS is fully up.
+    // Initialize USB Wi-Fi diagnostics after Arduino/FreeRTOS startup.
     // This also applies the XIAO ESP32-C6 antenna selection before Wi-Fi init.
     wifi_usb_monitor_init();
 
@@ -307,6 +308,7 @@ void loop() {
 
     OtaManager::handle();
     WiFiSetup::check();
+    wifi_usb_monitor_tick();
 
     // Suspend WiFi scanning during therapy/streaming/oximetry/OTA
     system_state_t sys_st = Arbiter::get_state();
