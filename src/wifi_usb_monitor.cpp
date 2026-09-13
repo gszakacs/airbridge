@@ -1,0 +1,139 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include "app_config.h"
+#include "wifi_setup.h"
+
+// USB serial Wi-Fi diagnostics for bench/debug use.
+// This module deliberately does NOT start Wi-Fi scans. It only reports the
+// current STA/AP state and any scan information already produced by the normal
+// AirBridge Wi-Fi state machine, so it does not add extra radio interruptions.
+
+static const uint32_t WIFI_MONITOR_INTERVAL_MS = 5000;
+static const uint32_t WIFI_MONITOR_START_DELAY_MS = 3000;
+
+static const char *mode_name(wifi_mode_t mode) {
+    switch (mode) {
+        case WIFI_MODE_NULL:   return "NULL";
+        case WIFI_MODE_STA:    return "STA";
+        case WIFI_MODE_AP:     return "AP";
+        case WIFI_MODE_APSTA:  return "AP+STA";
+        default:               return "?";
+    }
+}
+
+static const char *wl_status_name(wl_status_t status) {
+    switch (status) {
+        case WL_IDLE_STATUS:     return "idle";
+        case WL_NO_SSID_AVAIL:   return "no_ssid";
+        case WL_SCAN_COMPLETED:  return "scan_done";
+        case WL_CONNECTED:       return "connected";
+        case WL_CONNECT_FAILED:  return "connect_failed";
+        case WL_CONNECTION_LOST: return "connection_lost";
+        case WL_DISCONNECTED:    return "disconnected";
+        default:                 return "?";
+    }
+}
+
+static const char *cfg_mode_name(uint8_t mode) {
+    switch (mode) {
+        case WIFI_MODE_AUTO:     return "AUTO";
+        case WIFI_MODE_AP_ONLY:  return "AP_ONLY";
+        case WIFI_MODE_OFF:      return "OFF";
+        case WIFI_MODE_STA_ONLY: return "STA_ONLY";
+        case WIFI_MODE_STA_AP:   return "STA_AP";
+        default:                 return "?";
+    }
+}
+
+static void print_known_networks() {
+    auto &cfg = Config::get();
+    Serial.printf("[WIFI-MON] configured networks: %u\n", cfg.wifi_net_count);
+
+    for (uint8_t i = 0; i < cfg.wifi_net_count && i < WIFI_MAX_NETWORKS; ++i) {
+        const WiFiNetwork &net = cfg.wifi_nets[i];
+        int8_t rssi = WiFiSetup::net_rssi(i);
+        if (rssi != 0) {
+            Serial.printf("[WIFI-MON]   [%u] %s enabled=%s last_rssi=%d dBm\n",
+                          i, net.ssid.c_str(), net.enabled ? "yes" : "no", rssi);
+        } else {
+            Serial.printf("[WIFI-MON]   [%u] %s enabled=%s last_rssi=unknown\n",
+                          i, net.ssid.c_str(), net.enabled ? "yes" : "no");
+        }
+    }
+}
+
+static void print_scan_if_available() {
+    int16_t n = WiFi.scanComplete();
+    if (n < 0) return;
+
+    Serial.printf("[WIFI-MON] scan cache: %d visible AP(s)\n", n);
+    for (int i = 0; i < n; ++i) {
+        String bssid = WiFi.BSSIDstr(i);
+        Serial.printf("[WIFI-MON]   %2d: %-24s RSSI=%4d dBm ch=%2d BSSID=%s\n",
+                      i + 1,
+                      WiFi.SSID(i).c_str(),
+                      WiFi.RSSI(i),
+                      WiFi.channel(i),
+                      bssid.c_str());
+    }
+}
+
+static void print_status() {
+    auto &cfg = Config::get();
+    wifi_mode_t hw_mode = WiFi.getMode();
+    wl_status_t wl = WiFi.status();
+    bool connected = (wl == WL_CONNECTED);
+
+    Serial.printf("[WIFI-MON] cfg=%s hw=%s state=%s wl=%s",
+                  cfg_mode_name(cfg.wifi_mode),
+                  mode_name(hw_mode),
+                  WiFiSetup::state_name(),
+                  wl_status_name(wl));
+
+    if (connected) {
+        Serial.printf(" ssid='%s' rssi=%d dBm ch=%d ip=%s gw=%s",
+                      WiFi.SSID().c_str(),
+                      WiFi.RSSI(),
+                      WiFi.channel(),
+                      WiFi.localIP().toString().c_str(),
+                      WiFi.gatewayIP().toString().c_str());
+    }
+
+    bool ap_enabled = (hw_mode == WIFI_MODE_AP || hw_mode == WIFI_MODE_APSTA);
+    if (ap_enabled) {
+        Serial.printf(" ap_ip=%s ap_clients=%u",
+                      WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPgetStationNum());
+    }
+
+    Serial.println();
+
+    print_known_networks();
+    print_scan_if_available();
+}
+
+static void wifi_monitor_task(void *) {
+    vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_START_DELAY_MS));
+
+    for (;;) {
+        print_status();
+        vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_INTERVAL_MS));
+    }
+}
+
+// Arduino-ESP32 global constructors run from the Arduino app task after the
+// scheduler exists. Starting the diagnostics task here keeps the monitor
+// self-contained and avoids touching the main AirBridge control loop.
+class WiFiUsbMonitorStarter {
+public:
+    WiFiUsbMonitorStarter() {
+        xTaskCreate(wifi_monitor_task,
+                    "wifi_mon",
+                    4096,
+                    nullptr,
+                    1,
+                    nullptr);
+    }
+};
+
+static WiFiUsbMonitorStarter wifi_usb_monitor_starter;
