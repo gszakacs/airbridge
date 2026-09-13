@@ -12,6 +12,10 @@ static const uint32_t WIFI_MONITOR_START_DELAY_MS = 3000;
 static uint32_t wifi_monitor_started_ms = 0;
 static uint32_t wifi_monitor_last_ms = 0;
 
+static volatile uint8_t wifi_last_disconnect_reason = 0;
+static volatile uint32_t wifi_disconnect_count = 0;
+static volatile bool wifi_disconnect_pending = false;
+
 #if defined(AB_BOARD_XIAO_ESP32C6)
 #ifndef AB_EXTERNAL_ANTENNA
 #define AB_EXTERNAL_ANTENNA 0
@@ -44,6 +48,37 @@ static const char *antenna_name() {
 static void configure_xiao_c6_antenna() {}
 static const char *antenna_name() { return "board-default"; }
 #endif
+
+static const char *disconnect_reason_name(uint8_t reason) {
+    switch (reason) {
+        case 2:   return "AUTH_EXPIRE";
+        case 3:   return "AUTH_LEAVE";
+        case 4:   return "ASSOC_EXPIRE";
+        case 5:   return "ASSOC_TOOMANY";
+        case 6:   return "NOT_AUTHED";
+        case 7:   return "NOT_ASSOCED";
+        case 8:   return "ASSOC_LEAVE";
+        case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+        case 23:  return "802_1X_AUTH_FAILED";
+        case 200: return "BEACON_TIMEOUT";
+        case 201: return "NO_AP_FOUND";
+        case 202: return "AUTH_FAIL";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        case 206: return "AP_TSF_RESET";
+        case 208: return "ASSOC_COMEBACK_TIME_TOO_LONG";
+        default:  return "UNKNOWN";
+    }
+}
+
+static void wifi_monitor_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        wifi_last_disconnect_reason = info.wifi_sta_disconnected.reason;
+        wifi_disconnect_count++;
+        wifi_disconnect_pending = true;
+    }
+}
 
 static const char *mode_name(wifi_mode_t mode) {
     switch (mode) {
@@ -112,6 +147,14 @@ static void print_scan_if_available() {
     }
 }
 
+static void print_disconnect_event() {
+    uint8_t reason = wifi_last_disconnect_reason;
+    uint32_t count = wifi_disconnect_count;
+    wifi_disconnect_pending = false;
+    Serial.printf("[WIFI-MON] STA disconnect reason=%u (%s) count=%lu\n",
+                  reason, disconnect_reason_name(reason), (unsigned long)count);
+}
+
 static void print_status() {
     auto &cfg = Config::get();
     wifi_mode_t hw_mode = WiFi.getMode();
@@ -124,6 +167,14 @@ static void print_status() {
                   WiFiSetup::state_name(),
                   wl_status_name(wl),
                   antenna_name());
+
+    if (wifi_disconnect_count > 0) {
+        uint8_t reason = wifi_last_disconnect_reason;
+        Serial.printf(" last_disc=%u(%s) disc_count=%lu",
+                      reason,
+                      disconnect_reason_name(reason),
+                      (unsigned long)wifi_disconnect_count);
+    }
 
     if (connected) {
         Serial.printf(" ssid='%s' rssi=%d dBm ch=%d ip=%s gw=%s",
@@ -148,12 +199,18 @@ static void print_status() {
 
 void wifi_usb_monitor_init() {
     configure_xiao_c6_antenna();
+    WiFi.onEvent(wifi_monitor_event_cb);
     wifi_monitor_started_ms = millis();
     wifi_monitor_last_ms = 0;
 }
 
 void wifi_usb_monitor_tick() {
     uint32_t now = millis();
+
+    if (wifi_disconnect_pending) {
+        print_disconnect_event();
+    }
+
     if (now - wifi_monitor_started_ms < WIFI_MONITOR_START_DELAY_MS) return;
     if (wifi_monitor_last_ms != 0 && now - wifi_monitor_last_ms < WIFI_MONITOR_INTERVAL_MS) return;
 
