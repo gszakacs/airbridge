@@ -664,7 +664,7 @@ void ResmedOta::start_flash(const char *block, size_t fw_size,
     flash_params.force_blx = force_blx;
 
     xTaskCreatePinnedToCore(flash_task, "resmed_ota", FLASH_TASK_STACK,
-                            &flash_params, FLASH_TASK_PRIO, &flash_task_handle, 1);
+                            &flash_params, FLASH_TASK_PRIO, &flash_task_handle, AB_IO_TASK_CORE);
 }
 
 void ResmedOta::cancel()            { flash_cancel = true; }

@@ -8,7 +8,7 @@
 #include "app_config.h"
 #include <esp_partition.h>
 #include <time.h>
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "network_hints.h"
 #include "live_stream.h"
 #include "live_pmd.h"

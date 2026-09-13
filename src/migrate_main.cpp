@@ -5,7 +5,7 @@
 #include "app_config.h"
 #include "debug_log.h"
 #include "uart_arbiter.h"
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "airbridge_ota.h"
 #include "migrate.h"
 #include "network_hints.h"

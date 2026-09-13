@@ -679,9 +679,9 @@ void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud
     pq_init();
 
     xTaskCreatePinnedToCore(rx_task, "uart_rx", RX_TASK_STACK, nullptr,
-                            RX_TASK_PRIO, &rx_task_handle, 1);
+                            RX_TASK_PRIO, &rx_task_handle, AB_IO_TASK_CORE);
     xTaskCreatePinnedToCore(arbiter_task, "arbiter", ARBITER_TASK_STACK, nullptr,
-                            ARBITER_TASK_PRIO, &arbiter_task_handle, 1);
+                            ARBITER_TASK_PRIO, &arbiter_task_handle, AB_IO_TASK_CORE);
 }
 
 bool Arbiter::submit(uart_ticket_t *ticket) {

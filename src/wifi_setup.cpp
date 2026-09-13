@@ -1,4 +1,4 @@
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "app_config.h"
 #include "debug_log.h"
 #include "web_ui.h"

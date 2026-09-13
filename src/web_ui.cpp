@@ -7,7 +7,7 @@
 #include "resmed_ota.h"
 #include "debug_log.h"
 #include "app_config.h"
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "network_hints.h"
 #include "live_web_consumer.h"
 #include "crc.h"

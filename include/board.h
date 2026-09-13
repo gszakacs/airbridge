@@ -14,6 +14,12 @@
 #define AB_LED_GPIO 27
 #endif
 
+// AirBridge historically places the UART arbiter and ResMed OTA worker on
+// ESP32 core 1. Single-core parts such as ESP32-C6 must use core 0.
+#ifndef AB_IO_TASK_CORE
+#define AB_IO_TASK_CORE 1
+#endif
+
 #ifndef AB_STORAGE_SDMMC_ENABLED
 #define AB_STORAGE_SDMMC_ENABLED 0
 #endif

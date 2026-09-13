@@ -1,6 +1,6 @@
 #include "oxi_ble.h"
 #include "oxi_arbiter.h"
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "uart_arbiter.h"
 #include "debug_log.h"
 #include "app_config.h"
