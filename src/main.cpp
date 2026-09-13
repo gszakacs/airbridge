@@ -19,6 +19,7 @@ const char *airbridge_version() { return AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
 
 extern void dispatch_command(const char *line, String &response);
+extern void wifi_usb_monitor_init();
 
 #define SERIAL_LINE_MAX 256
 static char serial_line[SERIAL_LINE_MAX];
@@ -174,6 +175,10 @@ void setup() {
     delay(500);
     while (Serial.available()) Serial.read();  // flush boot garbage
     Log::init();
+
+    // Start USB Wi-Fi diagnostics only after Arduino/FreeRTOS is fully up.
+    // This also applies the XIAO ESP32-C6 antenna selection before Wi-Fi init.
+    wifi_usb_monitor_init();
 
     Log::printf("\n=== AirBridge " AIRBRIDGE_VERSION " ===\n");
     Log::printf("Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
