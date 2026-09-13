@@ -4,22 +4,19 @@
 #include "wifi_setup.h"
 
 // USB serial Wi-Fi diagnostics for bench/debug use.
-// This module deliberately does NOT start Wi-Fi scans. It only reports the
-// current STA/AP state and any scan information already produced by the normal
-// AirBridge Wi-Fi state machine, so it does not add extra radio interruptions.
+// No extra task is created. The main loop calls wifi_usb_monitor_tick(),
+// which reports status every 5 seconds and never starts its own scan.
 
 static const uint32_t WIFI_MONITOR_INTERVAL_MS = 5000;
 static const uint32_t WIFI_MONITOR_START_DELAY_MS = 3000;
+static uint32_t wifi_monitor_started_ms = 0;
+static uint32_t wifi_monitor_last_ms = 0;
 
 #if defined(AB_BOARD_XIAO_ESP32C6)
 #ifndef AB_EXTERNAL_ANTENNA
 #define AB_EXTERNAL_ANTENNA 0
 #endif
 
-// Seeed XIAO ESP32-C6 RF switch control:
-// GPIO3 LOW enables software control of the antenna switch.
-// GPIO14 LOW selects the onboard ceramic antenna.
-// GPIO14 HIGH selects the external U.FL antenna.
 static constexpr uint8_t XIAO_C6_RF_SWITCH_ENABLE_GPIO = 3;
 static constexpr uint8_t XIAO_C6_RF_SWITCH_SELECT_GPIO = 14;
 
@@ -145,32 +142,21 @@ static void print_status() {
     }
 
     Serial.println();
-
     print_known_networks();
     print_scan_if_available();
 }
 
-static void wifi_monitor_task(void *) {
-    vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_START_DELAY_MS));
-
-    for (;;) {
-        print_status();
-        vTaskDelay(pdMS_TO_TICKS(WIFI_MONITOR_INTERVAL_MS));
-    }
+void wifi_usb_monitor_init() {
+    configure_xiao_c6_antenna();
+    wifi_monitor_started_ms = millis();
+    wifi_monitor_last_ms = 0;
 }
 
-void wifi_usb_monitor_init() {
-    // Called explicitly from setup(), after Arduino/FreeRTOS startup is complete.
-    // Avoid doing GPIO/FreeRTOS work from a global constructor on ESP32-C6.
-    configure_xiao_c6_antenna();
+void wifi_usb_monitor_tick() {
+    uint32_t now = millis();
+    if (now - wifi_monitor_started_ms < WIFI_MONITOR_START_DELAY_MS) return;
+    if (wifi_monitor_last_ms != 0 && now - wifi_monitor_last_ms < WIFI_MONITOR_INTERVAL_MS) return;
 
-    BaseType_t ok = xTaskCreate(wifi_monitor_task,
-                                "wifi_mon",
-                                4096,
-                                nullptr,
-                                1,
-                                nullptr);
-    if (ok != pdPASS) {
-        Serial.println("[WIFI-MON] ERROR: failed to start monitor task");
-    }
+    wifi_monitor_last_ms = now;
+    print_status();
 }
