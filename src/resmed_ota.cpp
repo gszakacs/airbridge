@@ -403,9 +403,9 @@ static bool enter_bootloader(bool send_bll = true) {
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
 
-    // Mirror the current Python updater: no 0x55 flood.  Check BLS first,
-    // send one BLL from CDX, wait 200 ms, then gently poll BLS at 300 ms
-    // intervals.  If CDX answers BLS=0 again, re-send BLL and continue.
+    // Mirror the current Python updater: no 0x55 flood. Check BLS first,
+    // send BLL from CDX, wait 200 ms, then gently poll BLS. If CDX answers
+    // BLS=0 again, re-send BLL and continue.
     const int max_retries = 3;
     for (int retry = 0; retry < max_retries && !flash_cancel; retry++) {
         if (retry > 0) {
@@ -708,21 +708,14 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
             return false;
         }
 
-        size_t written = Arbiter::write_raw(frame, frame_len);
-        if (written != (size_t)frame_len) {
-            snprintf(flash_error, sizeof(flash_error),
-                     "Short UART write at frame %d: %u/%u bytes",
-                     frame_count + 1, (unsigned)written, (unsigned)frame_len);
-            return false;
-        }
+        Arbiter::write_raw(frame, frame_len);
         frame_count++;
         offset += chunk_len;
         flash_sent += chunk_len;
         seq = (seq + 1) & 0xFF;
 
-        // Python flushes every 20 frames.  HardwareSerial writes are synchronous
-        // enough for this bridge, but yield here to keep the same pacing and
-        // inspect only explicit bootloader error frames.
+        // Python flushes every 20 frames. Yield here for comparable pacing and
+        // inspect any explicit bootloader error frames that have arrived.
         if (frame_count % 20 == 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
             qframe_t rx;
@@ -753,11 +746,7 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
             snprintf(flash_error, sizeof(flash_error), "Completion frame build error");
             return false;
         }
-        size_t written = Arbiter::write_raw(frame, frame_len);
-        if (written != (size_t)frame_len) {
-            snprintf(flash_error, sizeof(flash_error), "Short completion-frame write");
-            return false;
-        }
+        Arbiter::write_raw(frame, frame_len);
         if (!check_flash_status()) return false;
     } else {
         Log::logf(CAT_OTA, LOG_INFO,
