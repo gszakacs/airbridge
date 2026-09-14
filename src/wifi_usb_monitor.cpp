@@ -4,8 +4,9 @@
 #include "wifi_setup.h"
 
 // USB serial Wi-Fi diagnostics for bench/debug use.
-// No extra task is created. The main loop calls wifi_usb_monitor_tick(),
-// which reports status every 5 seconds and never starts its own scan.
+// No extra task is created. The main loop calls wifi_usb_monitor_tick().
+// The tick runs before WiFiSetup::check() so completed scan results can be
+// printed before the normal Wi-Fi state machine consumes/deletes them.
 
 static const uint32_t WIFI_MONITOR_INTERVAL_MS = 5000;
 static const uint32_t WIFI_MONITOR_START_DELAY_MS = 3000;
@@ -72,6 +73,30 @@ static const char *disconnect_reason_name(uint8_t reason) {
     }
 }
 
+static const char *auth_mode_name(wifi_auth_mode_t auth) {
+    switch (auth) {
+        case WIFI_AUTH_OPEN:         return "OPEN";
+        case WIFI_AUTH_WEP:          return "WEP";
+        case WIFI_AUTH_WPA_PSK:      return "WPA-PSK";
+        case WIFI_AUTH_WPA2_PSK:     return "WPA2-PSK";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2-PSK";
+        case WIFI_AUTH_WPA2_ENTERPRISE:return "WPA2-ENT";
+#ifdef WIFI_AUTH_WPA3_PSK
+        case WIFI_AUTH_WPA3_PSK:     return "WPA3-PSK";
+#endif
+#ifdef WIFI_AUTH_WPA2_WPA3_PSK
+        case WIFI_AUTH_WPA2_WPA3_PSK:return "WPA2/WPA3-PSK";
+#endif
+#ifdef WIFI_AUTH_WAPI_PSK
+        case WIFI_AUTH_WAPI_PSK:     return "WAPI-PSK";
+#endif
+#ifdef WIFI_AUTH_OWE
+        case WIFI_AUTH_OWE:          return "OWE";
+#endif
+        default:                     return "OTHER";
+    }
+}
+
 static void wifi_monitor_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
         wifi_last_disconnect_reason = info.wifi_sta_disconnected.reason;
@@ -114,6 +139,17 @@ static const char *cfg_mode_name(uint8_t mode) {
     }
 }
 
+static bool configured_ssid(const String &ssid, uint8_t *idx_out = nullptr) {
+    auto &cfg = Config::get();
+    for (uint8_t i = 0; i < cfg.wifi_net_count && i < WIFI_MAX_NETWORKS; ++i) {
+        if (cfg.wifi_nets[i].enabled && cfg.wifi_nets[i].ssid.equalsIgnoreCase(ssid)) {
+            if (idx_out) *idx_out = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void print_known_networks() {
     auto &cfg = Config::get();
     Serial.printf("[WIFI-MON] configured networks: %u\n", cfg.wifi_net_count);
@@ -122,29 +158,44 @@ static void print_known_networks() {
         const WiFiNetwork &net = cfg.wifi_nets[i];
         int8_t rssi = WiFiSetup::net_rssi(i);
         if (rssi != 0) {
-            Serial.printf("[WIFI-MON]   [%u] %s enabled=%s last_rssi=%d dBm\n",
+            Serial.printf("[WIFI-MON]   [%u] %s enabled=%s last_scan_rssi=%d dBm\n",
                           i, net.ssid.c_str(), net.enabled ? "yes" : "no", rssi);
         } else {
-            Serial.printf("[WIFI-MON]   [%u] %s enabled=%s last_rssi=unknown\n",
+            Serial.printf("[WIFI-MON]   [%u] %s enabled=%s last_scan_rssi=unknown\n",
                           i, net.ssid.c_str(), net.enabled ? "yes" : "no");
         }
     }
 }
 
-static void print_scan_if_available() {
+// Called before WiFiSetup::check(), because process_scan_results() clears the
+// Arduino scan cache after consuming it. This shows exactly what this scan saw.
+static void print_completed_scan_if_available() {
     int16_t n = WiFi.scanComplete();
     if (n < 0) return;
 
-    Serial.printf("[WIFI-MON] scan cache: %d visible AP(s)\n", n);
+    Serial.printf("[WIFI-SCAN] completed: %d visible AP(s)\n", n);
+    uint8_t known_count = 0;
     for (int i = 0; i < n; ++i) {
+        String ssid = WiFi.SSID(i);
+        uint8_t cfg_idx = 0xFF;
+        bool known = configured_ssid(ssid, &cfg_idx);
+        if (known) known_count++;
+
         String bssid = WiFi.BSSIDstr(i);
-        Serial.printf("[WIFI-MON]   %2d: %-24s RSSI=%4d dBm ch=%2d BSSID=%s\n",
+        wifi_auth_mode_t auth = WiFi.encryptionType(i);
+        Serial.printf("[WIFI-SCAN] %c %2d: %-24s RSSI=%4d dBm ch=%2d auth=%s(%d) BSSID=%s",
+                      known ? '*' : ' ',
                       i + 1,
-                      WiFi.SSID(i).c_str(),
+                      ssid.c_str(),
                       WiFi.RSSI(i),
                       WiFi.channel(i),
+                      auth_mode_name(auth),
+                      (int)auth,
                       bssid.c_str());
+        if (known) Serial.printf(" configured_idx=%u", cfg_idx);
+        Serial.println();
     }
+    Serial.printf("[WIFI-SCAN] configured SSID matches in THIS scan: %u\n", known_count);
 }
 
 static void print_disconnect_event() {
@@ -194,7 +245,6 @@ static void print_status() {
 
     Serial.println();
     print_known_networks();
-    print_scan_if_available();
 }
 
 void wifi_usb_monitor_init() {
@@ -210,6 +260,11 @@ void wifi_usb_monitor_tick() {
     if (wifi_disconnect_pending) {
         print_disconnect_event();
     }
+
+    // Always check for a just-completed scan, independent of the 5-second
+    // status cadence. WiFiSetup::check() will consume/delete it immediately
+    // after this tick returns.
+    print_completed_scan_if_available();
 
     if (now - wifi_monitor_started_ms < WIFI_MONITOR_START_DELAY_MS) return;
     if (wifi_monitor_last_ms != 0 && now - wifi_monitor_last_ms < WIFI_MONITOR_INTERVAL_MS) return;
