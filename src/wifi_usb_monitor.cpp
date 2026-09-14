@@ -3,20 +3,12 @@
 #include "app_config.h"
 #include "wifi_setup.h"
 
-// USB serial Wi-Fi diagnostics for bench/debug use.
-// No extra task is created. The main loop calls wifi_usb_monitor_tick().
-// The tick runs before WiFiSetup::check() so completed scan results can be
-// printed before the normal Wi-Fi state machine consumes/deletes them.
+#ifndef AB_WIFI_DEBUG
+#define AB_WIFI_DEBUG 0
+#endif
 
-static const uint32_t WIFI_MONITOR_INTERVAL_MS = 5000;
-static const uint32_t WIFI_MONITOR_START_DELAY_MS = 3000;
-static uint32_t wifi_monitor_started_ms = 0;
-static uint32_t wifi_monitor_last_ms = 0;
-
-static volatile uint8_t wifi_last_disconnect_reason = 0;
-static volatile uint32_t wifi_disconnect_count = 0;
-static volatile bool wifi_disconnect_pending = false;
-
+// Keep antenna routing active in normal builds. Only the verbose USB Wi-Fi
+// diagnostics are controlled by AB_WIFI_DEBUG.
 #if defined(AB_BOARD_XIAO_ESP32C6)
 #ifndef AB_EXTERNAL_ANTENNA
 #define AB_EXTERNAL_ANTENNA 0
@@ -50,6 +42,17 @@ static void configure_xiao_c6_antenna() {}
 static const char *antenna_name() { return "board-default"; }
 #endif
 
+#if AB_WIFI_DEBUG
+
+static const uint32_t WIFI_MONITOR_INTERVAL_MS = 5000;
+static const uint32_t WIFI_MONITOR_START_DELAY_MS = 3000;
+static uint32_t wifi_monitor_started_ms = 0;
+static uint32_t wifi_monitor_last_ms = 0;
+
+static volatile uint8_t wifi_last_disconnect_reason = 0;
+static volatile uint32_t wifi_disconnect_count = 0;
+static volatile bool wifi_disconnect_pending = false;
+
 static const char *disconnect_reason_name(uint8_t reason) {
     switch (reason) {
         case 2:   return "AUTH_EXPIRE";
@@ -61,6 +64,7 @@ static const char *disconnect_reason_name(uint8_t reason) {
         case 8:   return "ASSOC_LEAVE";
         case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
         case 23:  return "802_1X_AUTH_FAILED";
+        case 36:  return "STA_LEAVING";
         case 200: return "BEACON_TIMEOUT";
         case 201: return "NO_AP_FOUND";
         case 202: return "AUTH_FAIL";
@@ -75,25 +79,13 @@ static const char *disconnect_reason_name(uint8_t reason) {
 
 static const char *auth_mode_name(wifi_auth_mode_t auth) {
     switch (auth) {
-        case WIFI_AUTH_OPEN:         return "OPEN";
-        case WIFI_AUTH_WEP:          return "WEP";
-        case WIFI_AUTH_WPA_PSK:      return "WPA-PSK";
-        case WIFI_AUTH_WPA2_PSK:     return "WPA2-PSK";
-        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2-PSK";
+        case WIFI_AUTH_OPEN:          return "OPEN";
+        case WIFI_AUTH_WEP:           return "WEP";
+        case WIFI_AUTH_WPA_PSK:       return "WPA-PSK";
+        case WIFI_AUTH_WPA2_PSK:      return "WPA2-PSK";
+        case WIFI_AUTH_WPA_WPA2_PSK:  return "WPA/WPA2-PSK";
         case WIFI_AUTH_WPA2_ENTERPRISE:return "WPA2-ENT";
-#ifdef WIFI_AUTH_WPA3_PSK
-        case WIFI_AUTH_WPA3_PSK:     return "WPA3-PSK";
-#endif
-#ifdef WIFI_AUTH_WPA2_WPA3_PSK
-        case WIFI_AUTH_WPA2_WPA3_PSK:return "WPA2/WPA3-PSK";
-#endif
-#ifdef WIFI_AUTH_WAPI_PSK
-        case WIFI_AUTH_WAPI_PSK:     return "WAPI-PSK";
-#endif
-#ifdef WIFI_AUTH_OWE
-        case WIFI_AUTH_OWE:          return "OWE";
-#endif
-        default:                     return "OTHER";
+        default:                      return "OTHER";
     }
 }
 
@@ -107,11 +99,11 @@ static void wifi_monitor_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 static const char *mode_name(wifi_mode_t mode) {
     switch (mode) {
-        case WIFI_MODE_NULL:   return "NULL";
-        case WIFI_MODE_STA:    return "STA";
-        case WIFI_MODE_AP:     return "AP";
-        case WIFI_MODE_APSTA:  return "AP+STA";
-        default:               return "?";
+        case WIFI_MODE_NULL:  return "NULL";
+        case WIFI_MODE_STA:   return "STA";
+        case WIFI_MODE_AP:    return "AP";
+        case WIFI_MODE_APSTA: return "AP+STA";
+        default:              return "?";
     }
 }
 
@@ -153,7 +145,6 @@ static bool configured_ssid(const String &ssid, uint8_t *idx_out = nullptr) {
 static void print_known_networks() {
     auto &cfg = Config::get();
     Serial.printf("[WIFI-MON] configured networks: %u\n", cfg.wifi_net_count);
-
     for (uint8_t i = 0; i < cfg.wifi_net_count && i < WIFI_MAX_NETWORKS; ++i) {
         const WiFiNetwork &net = cfg.wifi_nets[i];
         int8_t rssi = WiFiSetup::net_rssi(i);
@@ -167,8 +158,6 @@ static void print_known_networks() {
     }
 }
 
-// Called before WiFiSetup::check(), because process_scan_results() clears the
-// Arduino scan cache after consuming it. This shows exactly what this scan saw.
 static void print_completed_scan_if_available() {
     int16_t n = WiFi.scanComplete();
     if (n < 0) return;
@@ -184,14 +173,8 @@ static void print_completed_scan_if_available() {
         String bssid = WiFi.BSSIDstr(i);
         wifi_auth_mode_t auth = WiFi.encryptionType(i);
         Serial.printf("[WIFI-SCAN] %c %2d: %-24s RSSI=%4d dBm ch=%2d auth=%s(%d) BSSID=%s",
-                      known ? '*' : ' ',
-                      i + 1,
-                      ssid.c_str(),
-                      WiFi.RSSI(i),
-                      WiFi.channel(i),
-                      auth_mode_name(auth),
-                      (int)auth,
-                      bssid.c_str());
+                      known ? '*' : ' ', i + 1, ssid.c_str(), WiFi.RSSI(i),
+                      WiFi.channel(i), auth_mode_name(auth), (int)auth, bssid.c_str());
         if (known) Serial.printf(" configured_idx=%u", cfg_idx);
         Serial.println();
     }
@@ -213,33 +196,24 @@ static void print_status() {
     bool connected = (wl == WL_CONNECTED);
 
     Serial.printf("[WIFI-MON] cfg=%s hw=%s state=%s wl=%s antenna=%s",
-                  cfg_mode_name(cfg.wifi_mode),
-                  mode_name(hw_mode),
-                  WiFiSetup::state_name(),
-                  wl_status_name(wl),
-                  antenna_name());
+                  cfg_mode_name(cfg.wifi_mode), mode_name(hw_mode),
+                  WiFiSetup::state_name(), wl_status_name(wl), antenna_name());
 
     if (wifi_disconnect_count > 0) {
         uint8_t reason = wifi_last_disconnect_reason;
-        Serial.printf(" last_disc=%u(%s) disc_count=%lu",
-                      reason,
-                      disconnect_reason_name(reason),
-                      (unsigned long)wifi_disconnect_count);
+        Serial.printf(" last_disc=%u(%s) disc_count=%lu", reason,
+                      disconnect_reason_name(reason), (unsigned long)wifi_disconnect_count);
     }
 
     if (connected) {
         Serial.printf(" ssid='%s' rssi=%d dBm ch=%d ip=%s gw=%s",
-                      WiFi.SSID().c_str(),
-                      WiFi.RSSI(),
-                      WiFi.channel(),
-                      WiFi.localIP().toString().c_str(),
-                      WiFi.gatewayIP().toString().c_str());
+                      WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.channel(),
+                      WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
     }
 
     bool ap_enabled = (hw_mode == WIFI_MODE_AP || hw_mode == WIFI_MODE_APSTA);
     if (ap_enabled) {
-        Serial.printf(" ap_ip=%s ap_clients=%u",
-                      WiFi.softAPIP().toString().c_str(),
+        Serial.printf(" ap_ip=%s ap_clients=%u", WiFi.softAPIP().toString().c_str(),
                       WiFi.softAPgetStationNum());
     }
 
@@ -247,23 +221,25 @@ static void print_status() {
     print_known_networks();
 }
 
+#endif  // AB_WIFI_DEBUG
+
 void wifi_usb_monitor_init() {
     configure_xiao_c6_antenna();
+#if AB_WIFI_DEBUG
     WiFi.onEvent(wifi_monitor_event_cb);
     wifi_monitor_started_ms = millis();
     wifi_monitor_last_ms = 0;
+#endif
 }
 
 void wifi_usb_monitor_tick() {
+#if AB_WIFI_DEBUG
     uint32_t now = millis();
 
-    if (wifi_disconnect_pending) {
-        print_disconnect_event();
-    }
+    if (wifi_disconnect_pending) print_disconnect_event();
 
-    // Always check for a just-completed scan, independent of the 5-second
-    // status cadence. WiFiSetup::check() will consume/delete it immediately
-    // after this tick returns.
+    // The main loop calls this before WiFiSetup::check(), so debug builds can
+    // inspect a completed scan before the normal state machine deletes it.
     print_completed_scan_if_available();
 
     if (now - wifi_monitor_started_ms < WIFI_MONITOR_START_DELAY_MS) return;
@@ -271,4 +247,5 @@ void wifi_usb_monitor_tick() {
 
     wifi_monitor_last_ms = now;
     print_status();
+#endif
 }
