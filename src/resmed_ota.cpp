@@ -194,13 +194,20 @@ static bool query_hex_var(const char *name, int *value, uint16_t timeout_ms = 50
 }
 
 static bool query_device_bid(char *bid, size_t bid_size, uint16_t timeout_ms = 500) {
-    char resp[64] = {};
-    if (!send_raw_cmd("G S #BID", resp, sizeof(resp), timeout_ms)) return false;
-    const char *v = qframe_response_value(resp);
-    if (!v) return false;
-    strncpy(bid, v, bid_size - 1);
-    bid[bid_size - 1] = '\0';
-    return true;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char resp[64] = {};
+        Arbiter::clear_rx_frames();
+        if (send_raw_cmd("G S #BID", resp, sizeof(resp), timeout_ms)) {
+            const char *v = qframe_response_value(resp);
+            if (v) {
+                strncpy(bid, v, bid_size - 1);
+                bid[bid_size - 1] = '\0';
+                return true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return false;
 }
 
 static bool check_bid(const esp_partition_t *part, size_t blx_partition_offset, bool force) {
@@ -260,7 +267,7 @@ static bool switch_baud_verified(uint32_t target, bool quiet = false) {
     Arbiter::write_raw(frame, frame_len);
     vTaskDelay(pdMS_TO_TICKS(300));
     qframe_t ack;
-    Arbiter::wait_frame(&ack, 500); // consume ACK at old baud if present
+    Arbiter::wait_frame(&ack, 500);
 
     Arbiter::set_baud(target);
     sync_uart();
@@ -591,8 +598,6 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
 static bool wait_for_application() {
     uint32_t deadline = millis() + 15000;
     bool extended = false;
-
-    // Mirror resmed_flash.py: leave UART quiet so bootloader activity timeout can expire.
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     while ((int32_t)(deadline - millis()) > 0 && !flash_cancel) {
@@ -650,21 +655,29 @@ static void flash_task(void *param) {
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Using partition '%s' (0x%X, %u bytes)\n",
               part->label, part->address, part->size);
 
-    Arbiter::set_state(SYS_OTA_AIRSENSE);
+    // Stop device-side live streams while normal command arbitration is still active.
+    // This avoids residual PMD/L-frames filling the raw RX queue during the OTA handoff.
+    strncpy(flash_phase, "Suspend streams", sizeof(flash_phase));
+    if (!LiveStream::suspend()) {
+        snprintf(flash_error, sizeof(flash_error), "Failed to stop live streams");
+        goto cleanup;
+    }
+    vTaskDelay(pdMS_TO_TICKS(250));
+    Arbiter::clear_rx_frames();
+
+    // Let any queued normal command finish, then take exclusive OTA ownership.
     strncpy(flash_phase, "Claim UART", sizeof(flash_phase));
     if (!Arbiter::wait_idle(3000)) {
         snprintf(flash_error, sizeof(flash_error), "UART busy before OTA");
         goto cleanup;
     }
+    Arbiter::set_state(SYS_OTA_AIRSENSE);
 
-    strncpy(flash_phase, "Suspend streams", sizeof(flash_phase));
-    if (!LiveStream::suspend_for_ota()) {
-        snprintf(flash_error, sizeof(flash_error), "Failed to stop live streams");
-        goto cleanup;
-    }
-
+    // Preflight at the AirSense default baud. Do not send the 0x55 sync preamble
+    // here; Python only uses that after an actual BDD baud transition.
     Arbiter::set_baud(57600);
-    sync_uart();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    Arbiter::clear_rx_frames();
 
     if (!validate_flash_input(part, p)) goto cleanup;
 
@@ -686,8 +699,6 @@ static void flash_task(void *param) {
             Arbiter::set_baud(57600);
             sync_uart();
 
-            // Do not accept a generic R-frame as proof. Require BLS>=1/BID, and
-            // re-enter with BLL if the application came back, matching Python tool behavior.
             if (!enter_bootloader(true)) {
                 snprintf(flash_error, sizeof(flash_error), "Lost bootloader after BLX flash");
                 goto cleanup;
@@ -712,7 +723,6 @@ static void flash_task(void *param) {
     strncpy(flash_phase, "Reset device", sizeof(flash_phase));
     if (Arbiter::get_baud() != 57600) {
         if (!switch_baud_verified(57600)) {
-            // Completion may already have reset the target to its default baud.
             Arbiter::set_baud(57600);
             sync_uart();
         }
