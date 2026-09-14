@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include "app_config.h"
 #include "wifi_setup.h"
+#include "status_led.h"
 
 #ifndef AB_WIFI_DEBUG
 #define AB_WIFI_DEBUG 0
@@ -225,6 +226,7 @@ static void print_status() {
 
 void wifi_usb_monitor_init() {
     configure_xiao_c6_antenna();
+    StatusLed_init();
 #if AB_WIFI_DEBUG
     WiFi.onEvent(wifi_monitor_event_cb);
     wifi_monitor_started_ms = millis();
@@ -233,6 +235,7 @@ void wifi_usb_monitor_init() {
 }
 
 void wifi_usb_monitor_tick() {
+    StatusLed_tick();
 #if AB_WIFI_DEBUG
     uint32_t now = millis();
 
