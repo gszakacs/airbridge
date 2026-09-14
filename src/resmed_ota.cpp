@@ -13,7 +13,7 @@
 #define CHUNK_SIZE          250
 #define BID_OFFSET_SX577    0x3F80
 #define FULL_IMAGE_SIZE     0x100000
-#define BOOTLOADER_CATCH_TEST_ONLY 1
+#define BOOTLOADER_CATCH_TEST_ONLY 0
 
 const esp_partition_t* ResmedOta::get_staging_partition() {
     const esp_partition_t *p = esp_partition_find_first(
@@ -261,10 +261,8 @@ static void log_catch_frame(const qframe_t &rx, uint32_t elapsed_ms, int probe) 
               rx.payload_len > n ? "..." : "");
 }
 
-// Diagnostic-only single-shot probing after one BLL reboot command.  There is
-// deliberately no 0x55 flood and no repeated BLS hammering.  At each target
-// time we send exactly one G S #BLS frame, collect responses briefly, and log
-// what came back.  Erase/write remain hard-disabled by TEST_ONLY below.
+// Kept for diagnostics; production OTA uses the same gentle polling sequence
+// as python/resmed_flash.py rather than the old flood/single-shot experiments.
 static bool probe_bootloader_single_shot(int *caught_bls) {
     static const uint16_t probe_at_ms[] = {20, 50, 100, 200, 400, 800};
     const int probe_count = sizeof(probe_at_ms) / sizeof(probe_at_ms[0]);
@@ -296,40 +294,24 @@ static bool probe_bootloader_single_shot(int *caught_bls) {
         }
 
         Arbiter::clear_rx_frames();
-        Log::logf(CAT_OTA, LOG_INFO,
-                  "[OTA] Single-shot BLS probe %d/%d at +%u ms\n",
-                  i + 1, probe_count, (unsigned)(millis() - start));
         Arbiter::write_raw(bls_frame, bls_len);
 
         const uint32_t read_until = millis() + 35;
-        bool saw_frame = false;
         while ((int32_t)(read_until - millis()) > 0 && !flash_cancel) {
             qframe_t rx;
             if (!Arbiter::wait_frame(&rx, 5)) continue;
-            saw_frame = true;
-            log_catch_frame(rx, millis() - start, i + 1);
             int bls = -1;
             if (extract_bls_from_frame(rx, &bls)) {
                 last_bls = bls;
-                Log::logf(CAT_OTA, LOG_INFO,
-                          "[OTA] Single-shot BLS=%d at +%u ms (probe %d)\n",
-                          bls, (unsigned)(millis() - start), i + 1);
                 if (bls >= 1) {
                     if (caught_bls) *caught_bls = bls;
                     return true;
                 }
             }
         }
-        if (!saw_frame) {
-            Log::logf(CAT_OTA, LOG_INFO,
-                      "[OTA] Single-shot probe %d: no response in 35 ms\n", i + 1);
-        }
     }
 
     if (caught_bls) *caught_bls = last_bls;
-    Log::logf(CAT_OTA, LOG_WARN,
-              "[OTA] Single-shot diagnostic complete; no bootloader BLS caught (last BLS=%d)\n",
-              last_bls);
     return false;
 }
 
@@ -421,45 +403,87 @@ static bool enter_bootloader(bool send_bll = true) {
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
 
-    int bls = -1;
-    if (query_hex_var("BLS", &bls, 300) && bls >= 1) {
-        char bid[32] = {};
-        if (query_device_bid(bid, sizeof(bid), 500)) {
-            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Already in bootloader (BLS=%d, BID=%s)\n", bls, bid);
-            return true;
+    // Mirror the current Python updater: no 0x55 flood.  Check BLS first,
+    // send one BLL from CDX, wait 200 ms, then gently poll BLS at 300 ms
+    // intervals.  If CDX answers BLS=0 again, re-send BLL and continue.
+    const int max_retries = 3;
+    for (int retry = 0; retry < max_retries && !flash_cancel; retry++) {
+        if (retry > 0) {
+            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Bootloader retry %d/%d...\n",
+                      retry, max_retries - 1);
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
-    }
 
-    if (!send_bll) {
-        snprintf(flash_error, sizeof(flash_error), "Bootloader not already active");
-        return false;
-    }
-
-    Log::logf(CAT_OTA, LOG_INFO,
-              "[OTA] Single-shot diagnostic: one BLL, no 0x55 flood, BLS at 20/50/100/200/400/800 ms\n");
-
-    // Do not clear the BLL ACK after the write; the single-shot diagnostic logs
-    // it as part of the observed reboot sequence.
-    if (!send_bootloader_entry_no_wait(0)) {
-        snprintf(flash_error, sizeof(flash_error), "Failed to send BLL command");
-        return false;
-    }
-
-    int caught_bls = -1;
-    if (probe_bootloader_single_shot(&caught_bls)) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        char bid[32] = {};
-        if (query_device_bid(bid, sizeof(bid), 500)) {
-            Log::logf(CAT_OTA, LOG_INFO,
-                      "[OTA] Bootloader caught by single-shot probe (BLS=%d, BID=%s)\n",
-                      caught_bls, bid);
-            return true;
+        int bls = -1;
+        bool have_bls = query_hex_var("BLS", &bls, 300);
+        if (have_bls && bls >= 1) {
+            char bid[32] = {};
+            if (query_device_bid(bid, sizeof(bid), 500)) {
+                Log::logf(CAT_OTA, LOG_INFO,
+                          "[OTA] Already in bootloader (BLS=%d, BID=%s)\n", bls, bid);
+                return true;
+            }
         }
-        Log::logf(CAT_OTA, LOG_WARN,
-                  "[OTA] BLS indicated bootloader but BID query failed\n");
+
+        if (!have_bls) {
+            have_bls = query_hex_var("BLS", &bls, 300);
+            if (have_bls && bls >= 1) {
+                char bid[32] = {};
+                if (query_device_bid(bid, sizeof(bid), 500)) {
+                    Log::logf(CAT_OTA, LOG_INFO,
+                              "[OTA] Already in bootloader (BLS=%d, BID=%s)\n", bls, bid);
+                    return true;
+                }
+            }
+            if (!have_bls) continue;
+        }
+
+        if (!send_bll) {
+            snprintf(flash_error, sizeof(flash_error), "Bootloader not already active");
+            return false;
+        }
+
+        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Triggering reboot...\n");
+        if (!send_bootloader_entry_no_wait(50)) {
+            snprintf(flash_error, sizeof(flash_error), "Failed to send BLL command");
+            return false;
+        }
+        Arbiter::clear_rx_frames();
+
+        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Waiting for bootloader...\n");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        uint32_t started = millis();
+        for (int poll = 0; poll < 60 && !flash_cancel; poll++) {
+            int polled_bls = -1;
+            bool got = query_hex_var("BLS", &polled_bls, 300);
+            if (got && polled_bls >= 1) {
+                Log::logf(CAT_OTA, LOG_INFO,
+                          "[OTA] Bootloader caught at +%u ms (BLS=%d)\n",
+                          (unsigned)(millis() - started), polled_bls);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                Arbiter::clear_rx_frames();
+                char bid[32] = {};
+                if (query_device_bid(bid, sizeof(bid), 500)) {
+                    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Bootloader BID=%s\n", bid);
+                    return true;
+                }
+                break;
+            }
+
+            if (got && polled_bls == 0) {
+                Log::logf(CAT_OTA, LOG_INFO,
+                          "[OTA] CDX responded (BLS=0), re-sending BLL...\n");
+                if (!send_bootloader_entry_no_wait(300)) {
+                    snprintf(flash_error, sizeof(flash_error), "Failed to re-send BLL command");
+                    return false;
+                }
+            }
+        }
+
+        Log::logf(CAT_OTA, LOG_WARN, "[OTA] Failed to catch bootloader\n");
     }
 
-    snprintf(flash_error, sizeof(flash_error), "Single-shot bootloader diagnostic did not catch BLS>=1");
+    snprintf(flash_error, sizeof(flash_error), "Failed to catch bootloader");
     return false;
 }
 
@@ -684,12 +708,21 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
             return false;
         }
 
-        Arbiter::write_raw(frame, frame_len);
+        size_t written = Arbiter::write_raw(frame, frame_len);
+        if (written != (size_t)frame_len) {
+            snprintf(flash_error, sizeof(flash_error),
+                     "Short UART write at frame %d: %u/%u bytes",
+                     frame_count + 1, (unsigned)written, (unsigned)frame_len);
+            return false;
+        }
         frame_count++;
         offset += chunk_len;
         flash_sent += chunk_len;
         seq = (seq + 1) & 0xFF;
 
+        // Python flushes every 20 frames.  HardwareSerial writes are synchronous
+        // enough for this bridge, but yield here to keep the same pacing and
+        // inspect only explicit bootloader error frames.
         if (frame_count % 20 == 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
             qframe_t rx;
@@ -720,7 +753,11 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
             snprintf(flash_error, sizeof(flash_error), "Completion frame build error");
             return false;
         }
-        Arbiter::write_raw(frame, frame_len);
+        size_t written = Arbiter::write_raw(frame, frame_len);
+        if (written != (size_t)frame_len) {
+            snprintf(flash_error, sizeof(flash_error), "Short completion-frame write");
+            return false;
+        }
         if (!check_flash_status()) return false;
     } else {
         Log::logf(CAT_OTA, LOG_INFO,
