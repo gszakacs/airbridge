@@ -123,6 +123,21 @@ static const block_info_t* find_block(const char *name) {
     return nullptr;
 }
 
+static bool is_full_upload(const flash_params_t *p) {
+    return p && p->fw_size == FULL_IMAGE_SIZE;
+}
+
+// Match resmed_flash.py detect_input(): when a full 1 MiB image is uploaded and
+// a specific block is selected, use that block's file_offset/size from the full
+// image. A standalone block image still starts at staging offset 0.
+static size_t block_staging_offset(const flash_params_t *p, const block_info_t *block) {
+    return (is_full_upload(p) && block) ? block->file_offset : 0;
+}
+
+static size_t block_data_size(const flash_params_t *p, const block_info_t *block) {
+    return (is_full_upload(p) && block) ? block->max_size : (p ? p->fw_size : 0);
+}
+
 static int build_record_03(uint8_t *out, size_t out_size,
                            uint32_t addr, const uint8_t *data, size_t data_len) {
     size_t rec_len = 2 + 4 + data_len + 1;
@@ -394,16 +409,24 @@ static bool validate_flash_input(const esp_partition_t *part, const flash_params
         return false;
     }
 
-    bool is_full = strcmp(p->block, "FULL") == 0;
-    if (is_full) {
-        if (p->fw_size != FULL_IMAGE_SIZE) {
-            snprintf(flash_error, sizeof(flash_error), "FULL image must be exactly %u bytes", FULL_IMAGE_SIZE);
-            return false;
-        }
+    const bool full_upload = is_full_upload(p);
+    const bool target_full = strcmp(p->block, "FULL") == 0;
+
+    // A full upload always contains the BLX BID, even when the requested target
+    // is only CCX/CDX/CMX. Match Python's cross-flash guard before slicing.
+    if (full_upload) {
         char img_bid[32] = {};
         esp_partition_read(part, BID_OFFSET_SX577, img_bid, sizeof(img_bid) - 1);
         if (strncmp(img_bid, dev_bid, 20) != 0) {
-            snprintf(flash_error, sizeof(flash_error), "Image/device BID mismatch: %.20s / %.20s", img_bid, dev_bid);
+            snprintf(flash_error, sizeof(flash_error),
+                     "Image/device BID mismatch: %.20s / %.20s", img_bid, dev_bid);
+            return false;
+        }
+    }
+
+    if (target_full) {
+        if (!full_upload) {
+            snprintf(flash_error, sizeof(flash_error), "FULL target requires exactly %u-byte full image", FULL_IMAGE_SIZE);
             return false;
         }
         if (!verify_block_crc(part, 0x04000, 0x3C000) ||
@@ -423,28 +446,44 @@ static bool validate_flash_input(const esp_partition_t *part, const flash_params
         snprintf(flash_error, sizeof(flash_error), "Unknown block: %s", p->block);
         return false;
     }
-    if (p->fw_size != block->max_size) {
-        snprintf(flash_error, sizeof(flash_error), "%s image must be exactly %u bytes (got %u)",
+
+    size_t part_offset = block_staging_offset(p, block);
+    size_t data_size = block_data_size(p, block);
+
+    // Same rule as resmed_flash.py: a standalone block must be exactly the
+    // block size; a full image may be used as the source for any selected block.
+    if (!full_upload && data_size != block->max_size) {
+        snprintf(flash_error, sizeof(flash_error),
+                 "%s image must be exactly %u bytes (got %u)",
                  block->name, block->max_size, p->fw_size);
         return false;
     }
 
     if (strcmp(block->name, "CMX") == 0) {
-        if (!verify_block_crc(part, 0, 0x3C000) ||
-            !verify_block_crc(part, 0x3C000, 0xC0000)) {
+        // CMX contains CCX followed by CDX. Offsets differ depending on whether
+        // the source is a standalone CMX file or a 1 MiB full image.
+        const size_t ccx_off = part_offset;
+        const size_t cdx_off = part_offset + 0x3C000;
+        if (!verify_block_crc(part, ccx_off, 0x3C000) ||
+            !verify_block_crc(part, cdx_off, 0xC0000)) {
             snprintf(flash_error, sizeof(flash_error), "CMX CCX/CDX CRC validation failed");
             return false;
         }
     } else if (!(strcmp(block->name, "BLX") == 0 && p->force_blx)) {
-        if (!verify_block_crc(part, 0, block->max_size)) {
+        if (!verify_block_crc(part, part_offset, block->max_size)) {
             snprintf(flash_error, sizeof(flash_error), "%s CRC validation failed", block->name);
             return false;
         }
     }
 
     if (strcmp(block->name, "BLX") == 0 && !p->force_blx) {
-        if (!check_bid(part, 0, false)) return false;
+        if (!check_bid(part, part_offset, false)) return false;
     }
+
+    Log::logf(CAT_OTA, LOG_INFO,
+              "[OTA] Flash plan: source=%s target=%s staging_offset=0x%X size=%u\n",
+              full_upload ? "FULL" : "BLOCK", block->name,
+              (unsigned)part_offset, (unsigned)data_size);
     return true;
 }
 
@@ -631,20 +670,20 @@ static bool wait_for_application() {
 
 static void flash_task(void *param) {
     flash_params_t *p = (flash_params_t*)param;
-    bool is_full = (strcmp(p->block, "FULL") == 0);
+    bool target_full = (strcmp(p->block, "FULL") == 0);
 
     flash_active = true;
     flash_cancel = false;
     flash_sent = 0;
     flash_error[0] = '\0';
 
-    if (is_full) {
+    if (target_full) {
         const block_info_t *cmx = find_block("CMX");
-        size_t cmx_size = min(p->fw_size - 0x4000, (size_t)cmx->max_size);
-        flash_total = cmx_size;
+        flash_total = cmx->max_size;
         if (p->flash_blx) flash_total += find_block("BLX")->max_size;
     } else {
-        flash_total = p->fw_size;
+        const block_info_t *block = find_block(p->block);
+        flash_total = block ? block_data_size(p, block) : p->fw_size;
     }
 
     const esp_partition_t *part = ResmedOta::get_staging_partition();
@@ -655,8 +694,6 @@ static void flash_task(void *param) {
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Using partition '%s' (0x%X, %u bytes)\n",
               part->label, part->address, part->size);
 
-    // Stop device-side live streams while normal command arbitration is still active.
-    // This avoids residual PMD/L-frames filling the raw RX queue during the OTA handoff.
     strncpy(flash_phase, "Suspend streams", sizeof(flash_phase));
     if (!LiveStream::suspend()) {
         snprintf(flash_error, sizeof(flash_error), "Failed to stop live streams");
@@ -665,7 +702,6 @@ static void flash_task(void *param) {
     vTaskDelay(pdMS_TO_TICKS(250));
     Arbiter::clear_rx_frames();
 
-    // Let any queued normal command finish, then take exclusive OTA ownership.
     strncpy(flash_phase, "Claim UART", sizeof(flash_phase));
     if (!Arbiter::wait_idle(3000)) {
         snprintf(flash_error, sizeof(flash_error), "UART busy before OTA");
@@ -673,8 +709,6 @@ static void flash_task(void *param) {
     }
     Arbiter::set_state(SYS_OTA_AIRSENSE);
 
-    // Preflight at the AirSense default baud. Do not send the 0x55 sync preamble
-    // here; Python only uses that after an actual BDD baud transition.
     Arbiter::set_baud(57600);
     vTaskDelay(pdMS_TO_TICKS(50));
     Arbiter::clear_rx_frames();
@@ -688,7 +722,7 @@ static void flash_task(void *param) {
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Negotiating best baud...\n");
     if (!negotiate_best_baud()) goto cleanup;
 
-    if (is_full) {
+    if (target_full) {
         if (p->flash_blx) {
             const block_info_t *blx = find_block("BLX");
             if (!flash_one_block(part, 0, blx, blx->max_size, false)) goto cleanup;
@@ -709,15 +743,16 @@ static void flash_task(void *param) {
         }
 
         const block_info_t *cmx = find_block("CMX");
-        size_t cmx_size = min(p->fw_size - 0x4000, (size_t)cmx->max_size);
-        if (!flash_one_block(part, 0x4000, cmx, cmx_size, true)) goto cleanup;
+        if (!flash_one_block(part, cmx->file_offset, cmx, cmx->max_size, true)) goto cleanup;
     } else {
         const block_info_t *block = find_block(p->block);
         if (!block) {
             snprintf(flash_error, sizeof(flash_error), "Unknown block: %s", p->block);
             goto cleanup;
         }
-        if (!flash_one_block(part, 0, block, p->fw_size, true)) goto cleanup;
+        const size_t part_offset = block_staging_offset(p, block);
+        const size_t data_size = block_data_size(p, block);
+        if (!flash_one_block(part, part_offset, block, data_size, true)) goto cleanup;
     }
 
     strncpy(flash_phase, "Reset device", sizeof(flash_phase));
