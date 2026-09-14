@@ -13,6 +13,7 @@
 #define CHUNK_SIZE          250
 #define BID_OFFSET_SX577    0x3F80
 #define FULL_IMAGE_SIZE     0x100000
+#define BOOTLOADER_CATCH_TEST_ONLY 1
 
 const esp_partition_t* ResmedOta::get_staging_partition() {
     const esp_partition_t *p = esp_partition_find_first(
@@ -127,9 +128,6 @@ static bool is_full_upload(const flash_params_t *p) {
     return p && p->fw_size == FULL_IMAGE_SIZE;
 }
 
-// Match resmed_flash.py detect_input(): when a full 1 MiB image is uploaded and
-// a specific block is selected, use that block's file_offset/size from the full
-// image. A standalone block image still starts at staging offset 0.
 static size_t block_staging_offset(const flash_params_t *p, const block_info_t *block) {
     return (is_full_upload(p) && block) ? block->file_offset : 0;
 }
@@ -190,9 +188,6 @@ static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
     return false;
 }
 
-// resmed_flash.py treats the bootloader-entry command specially: write it,
-// wait 50 ms, then discard any reply instead of waiting for an R-frame.  The
-// bootloader window can be short, so waiting for the BLL response can miss it.
 static bool send_bootloader_entry_no_wait() {
     uint8_t frame[QFRAME_MAX_RAW];
     int frame_len = qframe_build_cmd("P S #BLL 0001", frame, sizeof(frame));
@@ -236,6 +231,65 @@ static bool query_device_bid(char *bid, size_t bid_size, uint16_t timeout_ms = 5
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    return false;
+}
+
+static bool extract_bls_from_frame(const qframe_t &rx, int *bls) {
+    if (rx.type != QFRAME_TYPE_R || rx.payload_len == 0) return false;
+    char resp[64] = {};
+    uint16_t copy = min((uint16_t)rx.payload_len, (uint16_t)(sizeof(resp) - 1));
+    memcpy(resp, rx.payload, copy);
+    resp[copy] = '\0';
+    if (!strstr(resp, "BLS")) return false;
+    const char *v = qframe_response_value(resp);
+    if (!v) return false;
+    if (bls) *bls = (int)strtol(v, nullptr, 16);
+    return true;
+}
+
+// Run the timing-critical S10 bootloader catch entirely on the ESP32.
+// This intentionally mirrors the old resmed_flash.py S10 flood method, but
+// removes PC/TCP/Wi-Fi latency from the critical reboot window.
+static bool catch_bootloader_local(int *caught_bls, uint32_t window_ms = 1500) {
+    uint8_t bls_frame[64];
+    int bls_len = qframe_build_cmd("G S #BLS", bls_frame, sizeof(bls_frame));
+    if (bls_len <= 0) return false;
+
+    uint8_t preamble[128];
+    memset(preamble, 0x55, sizeof(preamble));
+    Arbiter::clear_rx_frames();
+
+    const uint32_t start = millis();
+    int probes = 0;
+    int last_bls = -1;
+
+    while ((millis() - start) < window_ms && !flash_cancel) {
+        Arbiter::write_raw(preamble, sizeof(preamble));
+        Arbiter::write_raw(bls_frame, bls_len);
+        probes++;
+
+        const uint32_t read_until = millis() + 35;
+        while ((int32_t)(read_until - millis()) > 0) {
+            qframe_t rx;
+            if (!Arbiter::wait_frame(&rx, 5)) continue;
+            int bls = -1;
+            if (extract_bls_from_frame(rx, &bls)) {
+                last_bls = bls;
+                Log::logf(CAT_OTA, LOG_INFO,
+                          "[OTA] Local BLS response: %d at +%u ms (probe %d)\n",
+                          bls, (unsigned)(millis() - start), probes);
+                if (bls >= 1) {
+                    if (caught_bls) *caught_bls = bls;
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (caught_bls) *caught_bls = last_bls;
+    Log::logf(CAT_OTA, LOG_WARN,
+              "[OTA] Local bootloader catch expired after %u ms (%d probes, last BLS=%d)\n",
+              (unsigned)(millis() - start), probes, last_bls);
     return false;
 }
 
@@ -327,54 +381,47 @@ static bool enter_bootloader(bool send_bll = true) {
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
 
-    if (send_bll) {
-        int bls = -1;
-        if (query_hex_var("BLS", &bls, 300) && bls >= 1) {
-            char bid[32] = {};
-            if (query_device_bid(bid, sizeof(bid), 500)) {
-                Log::logf(CAT_OTA, LOG_INFO, "[OTA] Already in bootloader (BLS=%d, BID=%s)\n", bls, bid);
-                return true;
-            }
+    int bls = -1;
+    if (query_hex_var("BLS", &bls, 300) && bls >= 1) {
+        char bid[32] = {};
+        if (query_device_bid(bid, sizeof(bid), 500)) {
+            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Already in bootloader (BLS=%d, BID=%s)\n", bls, bid);
+            return true;
         }
+    }
 
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Triggering reboot...\n");
+    if (!send_bll) {
+        snprintf(flash_error, sizeof(flash_error), "Bootloader not already active");
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 3 && !flash_cancel; attempt++) {
+        Log::logf(CAT_OTA, LOG_INFO,
+                  "[OTA] Local bootloader catch attempt %d/3: sending BLL...\n",
+                  attempt + 1);
         if (!send_bootloader_entry_no_wait()) {
             snprintf(flash_error, sizeof(flash_error), "Failed to send BLL command");
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
 
-    for (int i = 0; i < 60 && !flash_cancel; i++) {
-        int bls = -1;
-        if (query_hex_var("BLS", &bls, 300)) {
-            if (bls >= 1) {
-                vTaskDelay(pdMS_TO_TICKS(200));
-                char bid[32] = {};
-                if (query_device_bid(bid, sizeof(bid), 500)) {
-                    Log::logf(CAT_OTA, LOG_INFO,
-                              "[OTA] In bootloader (BLS=%d, BID=%s) after %d polls\n",
-                              bls, bid, i);
-                    return true;
-                }
-                Log::logf(CAT_OTA, LOG_WARN, "[OTA] BLS indicated bootloader but BID query failed\n");
-            } else if (bls == 0 && send_bll) {
+        int caught_bls = -1;
+        if (catch_bootloader_local(&caught_bls, 1500)) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            char bid[32] = {};
+            if (query_device_bid(bid, sizeof(bid), 500)) {
                 Log::logf(CAT_OTA, LOG_INFO,
-                          "[OTA] BLS=0, re-sending BLL and allowing reboot time...\n");
-                if (!send_bootloader_entry_no_wait()) {
-                    snprintf(flash_error, sizeof(flash_error), "Failed to re-send BLL command");
-                    return false;
-                }
-                vTaskDelay(pdMS_TO_TICKS(300));
-                continue;
+                          "[OTA] Bootloader caught locally (BLS=%d, BID=%s)\n",
+                          caught_bls, bid);
+                return true;
             }
-        } else if (i < 3 || i % 10 == 0) {
-            Log::logf(CAT_OTA, LOG_DEBUG, "[OTA] BLS poll %d: no response\n", i);
+            Log::logf(CAT_OTA, LOG_WARN,
+                      "[OTA] Local BLS caught bootloader but BID query failed\n");
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+        if (attempt < 2) vTaskDelay(pdMS_TO_TICKS(300));
     }
 
-    snprintf(flash_error, sizeof(flash_error), "Failed to enter bootloader");
+    snprintf(flash_error, sizeof(flash_error), "Failed to catch bootloader locally");
     return false;
 }
 
@@ -730,6 +777,20 @@ static void flash_task(void *param) {
 
     if (!enter_bootloader()) goto cleanup;
     if (flash_cancel) goto cleanup;
+
+#if BOOTLOADER_CATCH_TEST_ONLY
+    Log::logf(CAT_OTA, LOG_INFO,
+              "[OTA] TEST ONLY: bootloader catch succeeded; NO ERASE OR WRITE will be attempted\n");
+    strncpy(flash_phase, "BL test passed", sizeof(flash_phase));
+    {
+        char resp[48] = {};
+        send_raw_cmd("P S #RES 0001", resp, sizeof(resp), 2000);
+    }
+    if (!wait_for_application()) goto cleanup;
+    Log::logf(CAT_OTA, LOG_INFO,
+              "[OTA] TEST ONLY complete: application responding again\n");
+    goto cleanup;
+#endif
 
     strncpy(flash_phase, "Baud negotiate", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Negotiating best baud...\n");
