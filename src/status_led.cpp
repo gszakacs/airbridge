@@ -18,41 +18,32 @@ static inline void led_write(bool on) {
 
 void StatusLed_init() {
     pinMode(PIN_LED, OUTPUT);
-    // Briefly light the LED during startup so the hardware path is obvious.
+    // Light immediately at boot so the GPIO/polarity can be verified.
     led_write(true);
 }
 
-void StatusLed_tick(bool airsense_present) {
+void StatusLed_tick() {
     const uint32_t now = millis();
     const system_state_t st = Arbiter::get_state();
 
-    // Highest priority: firmware transfer / bootloader activity.
+    // Firmware transfer / bootloader activity: very fast blink.
     if (st == SYS_OTA_AIRSENSE || st == SYS_OTA_ESP || st == SYS_BOOTLOADER) {
-        led_write(((now / 100U) & 1U) == 0U);          // rapid 5 Hz blink
+        led_write(((now / 100U) & 1U) == 0U);
         return;
     }
 
-    // AirSense/UART health fault.
+    // AirSense/UART health fault: fast blink.
     if (st == SYS_ERROR) {
-        led_write(((now / 150U) & 1U) == 0U);          // fast ~3.3 Hz blink
+        led_write(((now / 150U) & 1U) == 0U);
         return;
     }
 
-    // Wi-Fi unavailable: obvious slow blink.
+    // Wi-Fi unavailable: slow 1 Hz blink.
     if (!WiFiSetup::is_connected()) {
-        led_write(((now / 500U) & 1U) == 0U);          // 1 Hz blink
+        led_write(((now / 500U) & 1U) == 0U);
         return;
     }
 
-    // Wi-Fi is good but the AirSense has not answered the most recent health
-    // poll. Two short flashes every 2 seconds distinguish this from Wi-Fi loss.
-    if (!airsense_present) {
-        const uint32_t phase = now % 2000U;
-        const bool on = (phase < 120U) || (phase >= 260U && phase < 380U);
-        led_write(on);
-        return;
-    }
-
-    // Normal operation (idle or therapy): steady ON.
+    // Normal operation, including therapy: steady ON.
     led_write(true);
 }
