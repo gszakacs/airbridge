@@ -35,12 +35,10 @@ static void serial_poll() {
                 serial_line[serial_pos] = '\0';
 
                 if (serial_line[0] == '$') {
-                    // Internal command
                     String response;
                     dispatch_command(serial_line + 1, response);
                     if (response.length() > 0) Serial.print(response);
                 } else {
-                    // Q-frame
                     char resp_buf[512] = {};
                     uint16_t resp_len = sizeof(resp_buf);
                     bool ok = Arbiter::send_cmd(serial_line, CMD_SRC_INTERNAL,
@@ -60,9 +58,6 @@ static void serial_poll() {
     }
 }
 
-// Health monitoring:
-//   ROP every 10s to detect therapy state
-//   MHR every 30 min and once on therapy stop
 #define HEALTH_POLL_INTERVAL_MS     10000
 #define HEALTH_TIMEOUT_MS           500
 #define MHR_POLL_INTERVAL_MS        (30UL * 60 * 1000)
@@ -81,7 +76,6 @@ static void poll_mhr() {
     uint16_t mhr_len = sizeof(mhr_resp);
     if (!Arbiter::send_cmd("G S #MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
                            mhr_resp, &mhr_len)) {
-        // UART unhappy; leave cache alone and retry next opportunity.
         return;
     }
     const char *mv = qframe_response_value(mhr_resp);
@@ -163,8 +157,6 @@ static void attempt_recovery() {
         consecutive_timeouts = 0;
         Arbiter::set_state(SYS_IDLE);
         Config::invalidate_device_info();
-        // AirSense may have rebooted; force re-subscribe regardless of
-        // the broker's stale subscribed flags.
         LiveStream::reattach();
     }
 }
@@ -174,19 +166,15 @@ bool pull_time_from_resmed(bool force = false);
 void setup() {
     Serial.begin(115200);
     delay(500);
-    while (Serial.available()) Serial.read();  // flush boot garbage
+    while (Serial.available()) Serial.read();
     Log::init();
 
-    // Initialize USB Wi-Fi diagnostics after Arduino/FreeRTOS startup.
-    // This also applies the XIAO ESP32-C6 antenna selection before Wi-Fi init.
     wifi_usb_monitor_init();
 
     Log::printf("\n=== AirBridge " AIRBRIDGE_VERSION " ===\n");
     Log::printf("Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
 
     Config::init();
-    // NetworkHints must come up before Config::load runs the wnet migration,
-    // because that step calls NetworkHints::upsert with legacy hint values.
     NetworkHints::init();
     Config::load();
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Config loaded\n");
@@ -210,7 +198,6 @@ void setup() {
         OtaManager::init();
     }
 
-    // If NTP didn't sync, fall back to resmed device clock
     if (!WiFiSetup::time_synced()) pull_time_from_resmed();
 
     OxiArbiter::init();
@@ -246,7 +233,6 @@ bool push_time_to_resmed() {
     uint16_t resp_len = sizeof(resp);
     bool ok_dac = Arbiter::send_cmd(dac_cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &resp_len);
     if (!ok_dac) {
-        // A device error is terminal until TIMESYNC; a timeout can be retried.
         if (resp[0]) clock_sync_pending = false;
         Log::logf(CAT_GENERAL, LOG_WARN, "[INIT] ResMed date %s: %s\n",
                   resp[0] ? "rejected (use TIMESYNC to retry)" : "timeout", resp);
@@ -307,10 +293,12 @@ void loop() {
     serial_poll();
 
     OtaManager::handle();
-    WiFiSetup::check();
-    wifi_usb_monitor_tick();
 
-    // Suspend WiFi scanning during therapy/streaming/oximetry/OTA
+    // Inspect completed scans before WiFiSetup::check() consumes and clears
+    // Arduino's scan cache.
+    wifi_usb_monitor_tick();
+    WiFiSetup::check();
+
     system_state_t sys_st = Arbiter::get_state();
     bool oxi_active = OxiArbiter::is_feeding();
     bool ota_active = (sys_st == SYS_OTA_AIRSENSE || sys_st == SYS_OTA_ESP);
@@ -335,20 +323,15 @@ void loop() {
     sync_resmed_clock();
 
     LiveWebConsumer::tick();
-
     OxiArbiter::poll();
 
-    // health monitoring
     if (millis() - last_health_poll >= HEALTH_POLL_INTERVAL_MS) {
         last_health_poll = millis();
 
         system_state_t st = Arbiter::get_state();
         if (st == SYS_IDLE || st == SYS_THERAPY) {
             poll_therapy_state();
-            // Catch-up resync if AirSense rebooted out from under us, or
-            // any consumer's initial subscribe attempt failed.
             LiveStream::resync();
-            // MHR refreshed 30 min cadence and at therapy-stop transition
             if (mhr_poll_due()) poll_mhr();
         } else if (st == SYS_ERROR) {
             attempt_recovery();
