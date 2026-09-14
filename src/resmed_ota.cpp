@@ -10,21 +10,17 @@
 
 #define FLASH_TASK_STACK    8192
 #define FLASH_TASK_PRIO     3
-
 #define CHUNK_SIZE          250
-#define BID_OFFSET_SX577    0x3F80  // BID string offset within BLX
+#define BID_OFFSET_SX577    0x3F80
+#define FULL_IMAGE_SIZE     0x100000
 
 const esp_partition_t* ResmedOta::get_staging_partition() {
-    // try dedicated resmed partition (backwards compatibility)
     const esp_partition_t *p = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "resmed");
     if (p) return p;
-
-    // or use inactive OTA app slot
     const esp_partition_t *running = esp_ota_get_running_partition();
     return esp_ota_get_next_update_partition(running);
 }
-
 
 static bool verify_block_crc(const esp_partition_t *part, size_t offset, size_t size) {
     uint8_t buf[128];
@@ -51,8 +47,6 @@ static bool check_bytes(const esp_partition_t *part, size_t offset,
 
 fw_verify_result_t ResmedOta::verify_image(const esp_partition_t *part, size_t fw_size) {
     fw_verify_result_t r = {};
-
-    // Block layout for SX577-0200
     const size_t BLX_OFF = 0x00000, BLX_SIZE = 0x04000;
     const size_t CCX_OFF = 0x04000, CCX_SIZE = 0x3C000;
     const size_t CDX_OFF = 0x40000, CDX_SIZE = 0xC0000;
@@ -61,7 +55,6 @@ fw_verify_result_t ResmedOta::verify_image(const esp_partition_t *part, size_t f
     r.has_ccx = (fw_size >= CCX_OFF + CCX_SIZE);
     r.has_cdx = (fw_size >= CDX_OFF + CDX_SIZE);
 
-    // BID check
     if (r.has_blx) {
         memset(r.bid, 0, sizeof(r.bid));
         esp_partition_read(part, BID_OFFSET_SX577, r.bid, sizeof(r.bid) - 1);
@@ -71,21 +64,16 @@ fw_verify_result_t ResmedOta::verify_image(const esp_partition_t *part, size_t f
         r.bid_ok = (strncmp(r.bid, "SX577-0200", 10) == 0);
     }
 
-    // Block CRCs
     if (r.has_blx) r.blx_crc_ok = verify_block_crc(part, BLX_OFF, BLX_SIZE);
     if (r.has_ccx) r.ccx_crc_ok = verify_block_crc(part, CCX_OFF, CCX_SIZE);
     if (r.has_cdx) r.cdx_crc_ok = verify_block_crc(part, CDX_OFF, CDX_SIZE);
 
-    // Bootloader patch detection
     r.blx_patch = BLX_PATCH_NONE;
     if (r.has_blx) {
-        // old airbreak method. breaks serial flashing
         const uint8_t patch_a[] = {0xC0, 0x46};
         if (check_bytes(part, 0xF0, patch_a, sizeof(patch_a))) {
             r.blx_patch = BLX_PATCH_A_DANGEROUS;
         }
-
-        // Method B: skip verification, but allow bootloader to run
         const uint8_t patch_b1[] = {0x01, 0x20, 0xC0, 0x46};
         const uint8_t patch_b2[] = {0x00, 0x20, 0xC0, 0x46};
         if (check_bytes(part, 0x310E, patch_b1, sizeof(patch_b1)) &&
@@ -94,7 +82,6 @@ fw_verify_result_t ResmedOta::verify_image(const esp_partition_t *part, size_t f
             r.blx_patch = BLX_PATCH_B_SAFE;
         }
     }
-
     return r;
 }
 
@@ -136,13 +123,10 @@ static const block_info_t* find_block(const char *name) {
     return nullptr;
 }
 
-// Format: [0x03] [length] [address:4 big-endian] [data...] [0x00]
-// length = 4 (addr) + data_len + 1 (trailing zero)
 static int build_record_03(uint8_t *out, size_t out_size,
                            uint32_t addr, const uint8_t *data, size_t data_len) {
-    size_t rec_len = 2 + 4 + data_len + 1;  // type + len + addr + data + zero
+    size_t rec_len = 2 + 4 + data_len + 1;
     if (out_size < rec_len) return -1;
-
     uint8_t payload_len = 4 + data_len + 1;
     out[0] = 0x03;
     out[1] = payload_len;
@@ -152,12 +136,9 @@ static int build_record_03(uint8_t *out, size_t out_size,
     out[5] = addr & 0xFF;
     memcpy(out + 6, data, data_len);
     out[6 + data_len] = 0x00;
-
     return (int)rec_len;
 }
 
-// Data frame: block_name + 0x00 + seq + record
-// Completion: block_name + 'F' + seq
 static int build_f_payload(uint8_t *out, size_t out_size,
                            const char *block_name, uint8_t seq,
                            const uint8_t *record, size_t record_len,
@@ -165,24 +146,20 @@ static int build_f_payload(uint8_t *out, size_t out_size,
     size_t name_len = strlen(block_name);
     size_t total = name_len + 1 + 1 + (is_completion ? 0 : record_len);
     if (out_size < total) return -1;
-
     memcpy(out, block_name, name_len);
     out[name_len] = is_completion ? 'F' : 0x00;
     out[name_len + 1] = seq;
     if (!is_completion && record && record_len > 0) {
         memcpy(out + name_len + 2, record, record_len);
     }
-
     return is_completion ? (int)(name_len + 2) : (int)(name_len + 2 + record_len);
 }
 
-// Bypasses arbiter queue
 static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
                          uint16_t timeout_ms = 2000) {
     uint8_t frame[QFRAME_MAX_RAW];
     int frame_len = qframe_build_cmd(cmd, frame, sizeof(frame));
     if (frame_len < 0) return false;
-
     Arbiter::clear_rx_frames();
     Arbiter::write_raw(frame, frame_len);
 
@@ -198,55 +175,116 @@ static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
     return false;
 }
 
-
 static bool send_and_check(const char *cmd, char *resp, uint16_t resp_size,
                            uint16_t timeout_ms = 3000) {
     uint16_t len = resp_size;
     return Arbiter::send_cmd(cmd, CMD_SRC_OTA, CMD_PRIO_CRITICAL,
-                              resp, &len, timeout_ms);
+                             resp, &len, timeout_ms);
 }
 
+static bool query_hex_var(const char *name, int *value, uint16_t timeout_ms = 500) {
+    char cmd[24];
+    char resp[64] = {};
+    snprintf(cmd, sizeof(cmd), "G S #%s", name);
+    if (!send_raw_cmd(cmd, resp, sizeof(resp), timeout_ms)) return false;
+    const char *v = qframe_response_value(resp);
+    if (!v) return false;
+    if (value) *value = (int)strtol(v, nullptr, 16);
+    return true;
+}
+
+static bool query_device_bid(char *bid, size_t bid_size, uint16_t timeout_ms = 500) {
+    char resp[64] = {};
+    if (!send_raw_cmd("G S #BID", resp, sizeof(resp), timeout_ms)) return false;
+    const char *v = qframe_response_value(resp);
+    if (!v) return false;
+    strncpy(bid, v, bid_size - 1);
+    bid[bid_size - 1] = '\0';
+    return true;
+}
 
 static bool check_bid(const esp_partition_t *part, size_t blx_partition_offset, bool force) {
     if (force) return true;
-
     strncpy(flash_phase, "BID check", sizeof(flash_phase));
 
     char img_bid[32] = {};
     esp_partition_read(part, blx_partition_offset + BID_OFFSET_SX577,
                        img_bid, sizeof(img_bid) - 1);
-
     char dev_bid[32] = {};
-    if (!send_and_check("G S #BID", dev_bid, sizeof(dev_bid))) {
+    if (!query_device_bid(dev_bid, sizeof(dev_bid))) {
         snprintf(flash_error, sizeof(flash_error), "Failed to read device BID");
         return false;
     }
-
-    const char *dev_bid_str = qframe_response_value(dev_bid);
-    if (!dev_bid_str) dev_bid_str = dev_bid;
-
-    if (strncmp(img_bid, dev_bid_str, 20) != 0) {
+    if (strncmp(img_bid, dev_bid, 20) != 0) {
         snprintf(flash_error, sizeof(flash_error),
-                 "BID mismatch: image=%.20s device=%.20s", img_bid, dev_bid_str);
+                 "BID mismatch: image=%.20s device=%.20s", img_bid, dev_bid);
         return false;
     }
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] BID check passed\n");
     return true;
 }
 
-
-static bool negotiate_baud_460800() {
-    uint8_t bdd_frame[64];
-    int bdd_len = qframe_build_cmd("P S #BDD 0002", bdd_frame, sizeof(bdd_frame));
-    if (bdd_len <= 0) return false;
+static void sync_uart() {
+    uint8_t preamble[128];
+    memset(preamble, 0x55, sizeof(preamble));
     Arbiter::clear_rx_frames();
-    Arbiter::write_raw(bdd_frame, bdd_len);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    qframe_t rx;
-    Arbiter::wait_frame(&rx, 500);
-    Arbiter::set_baud(460800);
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Baud set to %u\n", Arbiter::get_baud());
-    return true;
+    Arbiter::write_raw(preamble, sizeof(preamble));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    Arbiter::clear_rx_frames();
+}
+
+static const char* bdd_code_for(uint32_t baud) {
+    switch (baud) {
+        case 57600:  return "0000";
+        case 115200: return "0001";
+        case 460800: return "0002";
+        default: return nullptr;
+    }
+}
+
+static bool switch_baud_verified(uint32_t target, bool quiet = false) {
+    uint32_t old = Arbiter::get_baud();
+    if (old == target) return true;
+    const char *code = bdd_code_for(target);
+    if (!code) return false;
+
+    if (!quiet) Log::logf(CAT_OTA, LOG_INFO, "[OTA] Switching baud %u -> %u...\n", old, target);
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "P S #BDD %s", code);
+    uint8_t frame[64];
+    int frame_len = qframe_build_cmd(cmd, frame, sizeof(frame));
+    if (frame_len <= 0) return false;
+
+    Arbiter::clear_rx_frames();
+    Arbiter::write_raw(frame, frame_len);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    qframe_t ack;
+    Arbiter::wait_frame(&ack, 500); // consume ACK at old baud if present
+
+    Arbiter::set_baud(target);
+    sync_uart();
+
+    char bid[32] = {};
+    if (query_device_bid(bid, sizeof(bid), 500)) {
+        if (!quiet) Log::logf(CAT_OTA, LOG_INFO, "[OTA] Baud verified at %u (BID=%s)\n", target, bid);
+        return true;
+    }
+
+    if (!quiet) Log::logf(CAT_OTA, LOG_WARN, "[OTA] No BID response at %u; reverting to %u\n", target, old);
+    Arbiter::set_baud(old);
+    sync_uart();
+    return false;
+}
+
+static bool negotiate_best_baud() {
+    const uint32_t rates[] = {460800, 115200, 57600};
+    for (uint32_t rate : rates) {
+        if (Arbiter::get_baud() == rate) return true;
+        if (switch_baud_verified(rate)) return true;
+    }
+    snprintf(flash_error, sizeof(flash_error), "Failed to negotiate a verified UART baud");
+    return false;
 }
 
 static bool enter_bootloader(bool send_bll = true) {
@@ -254,13 +292,12 @@ static bool enter_bootloader(bool send_bll = true) {
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
 
-    // Match current resmed_flash.py timing: allow quiet time around BLL and
-    // use a 300 ms BLS response window instead of hammering the device.
     if (send_bll) {
-        if (send_raw_cmd("G S #BLS", resp, sizeof(resp), 300)) {
-            const char *bv = qframe_response_value(resp);
-            if (bv && strtol(bv, nullptr, 16) >= 1) {
-                Log::logf(CAT_OTA, LOG_INFO, "[OTA] Already in bootloader\n");
+        int bls = -1;
+        if (query_hex_var("BLS", &bls, 300) && bls >= 1) {
+            char bid[32] = {};
+            if (query_device_bid(bid, sizeof(bid), 500)) {
+                Log::logf(CAT_OTA, LOG_INFO, "[OTA] Already in bootloader (BLS=%d, BID=%s)\n", bls, bid);
                 return true;
             }
         }
@@ -271,32 +308,28 @@ static bool enter_bootloader(bool send_bll = true) {
     }
 
     for (int i = 0; i < 60 && !flash_cancel; i++) {
-        memset(resp, 0, sizeof(resp));
-        bool got = send_raw_cmd("G S #BLS", resp, sizeof(resp), 300);
-
-        if (got) {
-            const char *bv = qframe_response_value(resp);
-            if (bv) {
-                int bls = (int)strtol(bv, nullptr, 16);
-                if (bls >= 1) {
+        int bls = -1;
+        if (query_hex_var("BLS", &bls, 300)) {
+            if (bls >= 1) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                char bid[32] = {};
+                if (query_device_bid(bid, sizeof(bid), 500)) {
                     Log::logf(CAT_OTA, LOG_INFO,
-                              "[OTA] In bootloader (BLS=%d) after %d polls\n", bls, i);
+                              "[OTA] In bootloader (BLS=%d, BID=%s) after %d polls\n",
+                              bls, bid, i);
                     return true;
                 }
-
-                if (bls == 0 && send_bll) {
-                    Log::logf(CAT_OTA, LOG_INFO,
-                              "[OTA] BLS=0, re-sending BLL and allowing reboot time...\n");
-                    send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
-                    vTaskDelay(pdMS_TO_TICKS(300));
-                    continue;
-                }
+                Log::logf(CAT_OTA, LOG_WARN, "[OTA] BLS indicated bootloader but BID query failed\n");
+            } else if (bls == 0 && send_bll) {
+                Log::logf(CAT_OTA, LOG_INFO,
+                          "[OTA] BLS=0, re-sending BLL and allowing reboot time...\n");
+                send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+                vTaskDelay(pdMS_TO_TICKS(300));
+                continue;
             }
         } else if (i < 3 || i % 10 == 0) {
-            Log::logf(CAT_OTA, LOG_DEBUG,
-                      "[OTA] BLS poll %d: no response\n", i);
+            Log::logf(CAT_OTA, LOG_DEBUG, "[OTA] BLS poll %d: no response\n", i);
         }
-
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
@@ -307,7 +340,6 @@ static bool enter_bootloader(bool send_bll = true) {
 static bool wait_for_erase(uint32_t timeout_ms) {
     uint32_t t0 = millis();
     int p_count = 0;
-
     while (millis() - t0 < timeout_ms && !flash_cancel) {
         qframe_t rx;
         if (Arbiter::wait_frame(&rx, 500)) {
@@ -328,11 +360,90 @@ static bool wait_for_erase(uint32_t timeout_ms) {
     return false;
 }
 
+static bool check_flash_status() {
+    int ble = -1;
+    if (!query_hex_var("BLE", &ble, 1000)) {
+        snprintf(flash_error, sizeof(flash_error), "No BLE response after completion");
+        return false;
+    }
+    if (ble != 0) {
+        snprintf(flash_error, sizeof(flash_error), "Flash completion failed: BLE=%04X", ble);
+        return false;
+    }
+    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Completion confirmed: BLE=0000\n");
+    return true;
+}
+
+static bool validate_flash_input(const esp_partition_t *part, const flash_params_t *p) {
+    strncpy(flash_phase, "Validate image", sizeof(flash_phase));
+
+    char dev_bid[32] = {};
+    if (!query_device_bid(dev_bid, sizeof(dev_bid), 700)) {
+        snprintf(flash_error, sizeof(flash_error), "Unable to read device BID before flash");
+        return false;
+    }
+    if (strncmp(dev_bid, "SX577-0200", 10) != 0) {
+        snprintf(flash_error, sizeof(flash_error), "Unsupported device BID: %.20s", dev_bid);
+        return false;
+    }
+
+    bool is_full = strcmp(p->block, "FULL") == 0;
+    if (is_full) {
+        if (p->fw_size != FULL_IMAGE_SIZE) {
+            snprintf(flash_error, sizeof(flash_error), "FULL image must be exactly %u bytes", FULL_IMAGE_SIZE);
+            return false;
+        }
+        char img_bid[32] = {};
+        esp_partition_read(part, BID_OFFSET_SX577, img_bid, sizeof(img_bid) - 1);
+        if (strncmp(img_bid, dev_bid, 20) != 0) {
+            snprintf(flash_error, sizeof(flash_error), "Image/device BID mismatch: %.20s / %.20s", img_bid, dev_bid);
+            return false;
+        }
+        if (!verify_block_crc(part, 0x04000, 0x3C000) ||
+            !verify_block_crc(part, 0x40000, 0xC0000)) {
+            snprintf(flash_error, sizeof(flash_error), "FULL image CCX/CDX CRC validation failed");
+            return false;
+        }
+        if (p->flash_blx && !p->force_blx && !verify_block_crc(part, 0, 0x4000)) {
+            snprintf(flash_error, sizeof(flash_error), "BLX CRC validation failed");
+            return false;
+        }
+        return true;
+    }
+
+    const block_info_t *block = find_block(p->block);
+    if (!block) {
+        snprintf(flash_error, sizeof(flash_error), "Unknown block: %s", p->block);
+        return false;
+    }
+    if (p->fw_size != block->max_size) {
+        snprintf(flash_error, sizeof(flash_error), "%s image must be exactly %u bytes (got %u)",
+                 block->name, block->max_size, p->fw_size);
+        return false;
+    }
+
+    if (strcmp(block->name, "CMX") == 0) {
+        if (!verify_block_crc(part, 0, 0x3C000) ||
+            !verify_block_crc(part, 0x3C000, 0xC0000)) {
+            snprintf(flash_error, sizeof(flash_error), "CMX CCX/CDX CRC validation failed");
+            return false;
+        }
+    } else if (!(strcmp(block->name, "BLX") == 0 && p->force_blx)) {
+        if (!verify_block_crc(part, 0, block->max_size)) {
+            snprintf(flash_error, sizeof(flash_error), "%s CRC validation failed", block->name);
+            return false;
+        }
+    }
+
+    if (strcmp(block->name, "BLX") == 0 && !p->force_blx) {
+        if (!check_bid(part, 0, false)) return false;
+    }
+    return true;
+}
 
 static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
                             const block_info_t *block, size_t data_size,
                             bool send_completion = true) {
-    // Trim trailing 0xFF
     size_t trimmed_size = data_size;
     {
         uint8_t tail[256];
@@ -352,7 +463,6 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
             trimmed_size = check_off;
         }
     }
-    // Align to 4 bytes
     trimmed_size = (trimmed_size + 3) & ~3;
     if (trimmed_size == 0) {
         Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s data is all 0xFF, skipping\n", block->name);
@@ -360,15 +470,15 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
     }
 
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s: %u bytes (trimmed from %u)\n",
-                 block->name, trimmed_size, data_size);
+              block->name, trimmed_size, data_size);
 
-    // ERASE
-    {
-        char erase_cmd[24];
-        snprintf(erase_cmd, sizeof(erase_cmd), "P F *%s 0000", block->name);
-        snprintf(flash_phase, sizeof(flash_phase), "Erase %s", block->name);
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Erasing %s...\n", block->name);
+    char erase_cmd[24];
+    snprintf(erase_cmd, sizeof(erase_cmd), "P F *%s 0000", block->name);
+    snprintf(flash_phase, sizeof(flash_phase), "Erase %s", block->name);
 
+    bool erased = false;
+    for (int attempt = 0; attempt < 3 && !flash_cancel; attempt++) {
+        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Erasing %s (attempt %d/3)...\n", block->name, attempt + 1);
         uint8_t frame[64];
         int frame_len = qframe_build_cmd(erase_cmd, frame, sizeof(frame));
         if (frame_len < 0) {
@@ -377,16 +487,23 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
         }
         Arbiter::clear_rx_frames();
         Arbiter::write_raw(frame, frame_len);
-
-        if (!wait_for_erase(30000)) return false;
+        if (wait_for_erase(30000)) {
+            erased = true;
+            break;
+        }
+        if (attempt < 2) {
+            Log::logf(CAT_OTA, LOG_WARN, "[OTA] Erase stalled, retrying in 1s...\n");
+            flash_error[0] = '\0';
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
+    if (!erased) return false;
 
     vTaskDelay(pdMS_TO_TICKS(300));
 
-    // WRITE
     snprintf(flash_phase, sizeof(flash_phase), "Flash %s", block->name);
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Writing %u bytes to %s @ %u baud...\n",
-                 trimmed_size, block->name, Arbiter::get_baud());
+              trimmed_size, block->name, Arbiter::get_baud());
 
     uint8_t seq = 0;
     size_t offset = 0;
@@ -394,17 +511,13 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
 
     while (offset < trimmed_size && !flash_cancel) {
         size_t chunk_len = min((size_t)CHUNK_SIZE, trimmed_size - offset);
-
         uint8_t chunk_buf[CHUNK_SIZE];
-        esp_err_t err = esp_partition_read(part, part_offset + offset,
-                                            chunk_buf, chunk_len);
+        esp_err_t err = esp_partition_read(part, part_offset + offset, chunk_buf, chunk_len);
         if (err != ESP_OK) {
-            snprintf(flash_error, sizeof(flash_error),
-                     "Read error at %u: %s", offset, esp_err_to_name(err));
+            snprintf(flash_error, sizeof(flash_error), "Read error at %u: %s", offset, esp_err_to_name(err));
             return false;
         }
 
-        // Build binary record
         uint8_t record[CHUNK_SIZE + 8];
         uint32_t addr = block->base_addr + offset;
         int rec_len = build_record_03(record, sizeof(record), addr, chunk_buf, chunk_len);
@@ -413,16 +526,13 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
             return false;
         }
 
-        // Build F-frame payload
         uint8_t f_payload[CHUNK_SIZE + 16];
-        int f_len = build_f_payload(f_payload, sizeof(f_payload),
-                                     block->name, seq, record, rec_len, false);
+        int f_len = build_f_payload(f_payload, sizeof(f_payload), block->name, seq, record, rec_len, false);
         if (f_len < 0) {
             snprintf(flash_error, sizeof(flash_error), "F-payload build error");
             return false;
         }
 
-        // Build and send Q-frame type 'f'
         uint8_t frame[QFRAME_MAX_RAW];
         int frame_len = qframe_build('f', f_payload, f_len, frame, sizeof(frame));
         if (frame_len < 0) {
@@ -436,7 +546,6 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
         flash_sent += chunk_len;
         seq = (seq + 1) & 0xFF;
 
-        // Drain responses
         if (frame_count % 20 == 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
             qframe_t rx;
@@ -455,37 +564,68 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
     if (flash_cancel) return false;
 
     if (send_completion) {
-        // Completion frame
         snprintf(flash_phase, sizeof(flash_phase), "Complete %s", block->name);
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Sending completion frame for %s (%d frames sent)...\n",
-                     block->name, frame_count);
-
-        {
-            uint8_t f_payload[8];
-            int f_len = build_f_payload(f_payload, sizeof(f_payload),
-                                         block->name, seq, nullptr, 0, true);
-            uint8_t frame[64];
-            int frame_len = qframe_build('f', f_payload, f_len, frame, sizeof(frame));
-            if (frame_len > 0) {
-                Arbiter::write_raw(frame, frame_len);
-            }
+        Log::logf(CAT_OTA, LOG_INFO,
+                  "[OTA] Sending completion frame for %s (%d frames sent)...\n",
+                  block->name, frame_count);
+        uint8_t f_payload[8];
+        int f_len = build_f_payload(f_payload, sizeof(f_payload), block->name, seq, nullptr, 0, true);
+        uint8_t frame[64];
+        int frame_len = qframe_build('f', f_payload, f_len, frame, sizeof(frame));
+        if (frame_len <= 0) {
+            snprintf(flash_error, sizeof(flash_error), "Completion frame build error");
+            return false;
         }
-
-        // Device resets after completion - restore baud
-        Arbiter::set_baud(57600);
+        Arbiter::write_raw(frame, frame_len);
+        if (!check_flash_status()) return false;
     } else {
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s data sent (%d frames), skipping completion (chaining)\n",
-                     block->name, frame_count);
+        Log::logf(CAT_OTA, LOG_INFO,
+                  "[OTA] %s data sent (%d frames), skipping completion (chaining)\n",
+                  block->name, frame_count);
     }
 
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s flash done\n", block->name);
     return true;
 }
 
+static bool wait_for_application() {
+    uint32_t deadline = millis() + 15000;
+    bool extended = false;
+
+    // Mirror resmed_flash.py: leave UART quiet so bootloader activity timeout can expire.
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    while ((int32_t)(deadline - millis()) > 0 && !flash_cancel) {
+        int bls = -1;
+        if (query_hex_var("BLS", &bls, 300)) {
+            if (bls == 0) return true;
+
+            int ble = -1;
+            bool have_ble = query_hex_var("BLE", &ble, 500);
+            if ((have_ble && ble != 0) || bls >= 2) {
+                snprintf(flash_error, sizeof(flash_error),
+                         "Application did not start: BLS=%04X%s",
+                         bls, have_ble ? ", BLE nonzero" : "");
+                return false;
+            }
+            if (have_ble && ble == 0 && !extended) {
+                Log::logf(CAT_OTA, LOG_INFO,
+                          "[OTA] Bootloader BLE=0000; allowing 5s more for application startup...\n");
+                deadline += 5000;
+                extended = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    snprintf(flash_error, sizeof(flash_error), "Device did not return to app after flash");
+    return false;
+}
 
 static void flash_task(void *param) {
     flash_params_t *p = (flash_params_t*)param;
-    char resp[48] = {};
     bool is_full = (strcmp(p->block, "FULL") == 0);
 
     flash_active = true;
@@ -493,14 +633,11 @@ static void flash_task(void *param) {
     flash_sent = 0;
     flash_error[0] = '\0';
 
-    // Calculate total bytes
     if (is_full) {
         const block_info_t *cmx = find_block("CMX");
         size_t cmx_size = min(p->fw_size - 0x4000, (size_t)cmx->max_size);
         flash_total = cmx_size;
-        if (p->flash_blx) {
-            flash_total += find_block("BLX")->max_size;
-        }
+        if (p->flash_blx) flash_total += find_block("BLX")->max_size;
     } else {
         flash_total = p->fw_size;
     }
@@ -526,97 +663,73 @@ static void flash_task(void *param) {
         goto cleanup;
     }
 
-    // BLX safety check
-    if ((is_full && p->flash_blx) || strcmp(p->block, "BLX") == 0) {
-        if (!check_bid(part, 0, p->force_blx)) goto cleanup;
-    }
+    Arbiter::set_baud(57600);
+    sync_uart();
+
+    if (!validate_flash_input(part, p)) goto cleanup;
 
     if (!enter_bootloader()) goto cleanup;
     if (flash_cancel) goto cleanup;
 
-    // Negotiate baud
-    {
-        strncpy(flash_phase, "Baud negotiate", sizeof(flash_phase));
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Negotiating baud 460800...\n");
-        negotiate_baud_460800();
-    }
+    strncpy(flash_phase, "Baud negotiate", sizeof(flash_phase));
+    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Negotiating best baud...\n");
+    if (!negotiate_best_baud()) goto cleanup;
 
     if (is_full) {
-        // FULL image: BLX (optional, no completion) -> CMX (with completion)
         if (p->flash_blx) {
             const block_info_t *blx = find_block("BLX");
-            // Skip completion frame
             if (!flash_one_block(part, 0, blx, blx->max_size, false)) goto cleanup;
 
-            // Bootloader enters mode 5 (upgrade) after receiving data.
-            // Without completion frame, mode 5 times out after ~2s and
-            // bootloader reverts to idle at 57600 baud.
             strncpy(flash_phase, "BLX mode timeout", sizeof(flash_phase));
             Log::logf(CAT_OTA, LOG_INFO, "[OTA] Waiting for mode 5 timeout (~2s)...\n");
             vTaskDelay(pdMS_TO_TICKS(2500));
             Arbiter::set_baud(57600);
+            sync_uart();
 
-            // Verify still in bootloader
-            char bl_resp[48] = {};
-            if (!send_raw_cmd("G S #BLS", bl_resp, sizeof(bl_resp), 500)) {
-                snprintf(flash_error, sizeof(flash_error),
-                         "Lost bootloader after BLX flash");
+            // Do not accept a generic R-frame as proof. Require BLS>=1/BID, and
+            // re-enter with BLL if the application came back, matching Python tool behavior.
+            if (!enter_bootloader(true)) {
+                snprintf(flash_error, sizeof(flash_error), "Lost bootloader after BLX flash");
                 goto cleanup;
             }
-            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Still in bootloader after BLX\n");
 
-            // Re-negotiate baud for CMX
-            {
-                Log::logf(CAT_OTA, LOG_INFO, "[OTA] Re-negotiating baud 460800...\n");
-                negotiate_baud_460800();
-            }
+            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Bootloader confirmed after BLX\n");
+            if (!negotiate_best_baud()) goto cleanup;
         }
 
         const block_info_t *cmx = find_block("CMX");
         size_t cmx_size = min(p->fw_size - 0x4000, (size_t)cmx->max_size);
-
         if (!flash_one_block(part, 0x4000, cmx, cmx_size, true)) goto cleanup;
-
     } else {
         const block_info_t *block = find_block(p->block);
         if (!block) {
             snprintf(flash_error, sizeof(flash_error), "Unknown block: %s", p->block);
             goto cleanup;
         }
-        if (p->fw_size > block->max_size) {
-            snprintf(flash_error, sizeof(flash_error), "Firmware %u > %s max %u",
-                     p->fw_size, block->name, block->max_size);
-            goto cleanup;
-        }
-        if (!flash_one_block(part, 0, block, p->fw_size)) goto cleanup;
+        if (!flash_one_block(part, 0, block, p->fw_size, true)) goto cleanup;
     }
 
-    // Wait for device to boot new firmware
+    strncpy(flash_phase, "Reset device", sizeof(flash_phase));
+    if (Arbiter::get_baud() != 57600) {
+        if (!switch_baud_verified(57600)) {
+            // Completion may already have reset the target to its default baud.
+            Arbiter::set_baud(57600);
+            sync_uart();
+        }
+    }
+
+    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Resetting AirSense...\n");
     {
-        strncpy(flash_phase, "Verifying", sizeof(flash_phase));
-        Arbiter::set_baud(57600);
-        bool app_running = false;
-        for (int i = 0; i < 30 && !flash_cancel; i++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            memset(resp, 0, sizeof(resp));
-            if (send_raw_cmd("G S #BLS", resp, sizeof(resp), 2000)) {
-                const char *bv = qframe_response_value(resp);
-                if (bv) {
-                    int bls = (int)strtol(bv, nullptr, 16);
-                    if (bls == 0) { app_running = true; break; }
-                }
-            }
-        }
-
-        if (app_running) {
-            strncpy(flash_phase, "Complete", sizeof(flash_phase));
-            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Flash complete, device running\n");
-            Config::invalidate_device_info();
-        } else if (!flash_cancel) {
-            snprintf(flash_error, sizeof(flash_error),
-                     "Device did not return to app after flash");
-        }
+        char resp[48] = {};
+        send_raw_cmd("P S #RES 0001", resp, sizeof(resp), 2000);
     }
+
+    strncpy(flash_phase, "Verifying", sizeof(flash_phase));
+    if (!wait_for_application()) goto cleanup;
+
+    strncpy(flash_phase, "Complete", sizeof(flash_phase));
+    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Flash complete, device running (BLS=0000)\n");
+    Config::invalidate_device_info();
 
 cleanup:
     Arbiter::set_baud(57600);
@@ -636,15 +749,12 @@ done:
     vTaskDelete(nullptr);
 }
 
-
-
 const char* ResmedOta::detect_block(size_t fw_size) {
-    if (fw_size == 0) return nullptr;
-    if (fw_size <= 0x4000)   return "BLX";
-    if (fw_size <= 0x3C000)  return "CCX";
-    if (fw_size <= 0xC0000)  return "CDX";
-    if (fw_size <= 0xFC000)  return "CMX";
-    if (fw_size <= 0x100000) return "FULL";
+    if (fw_size == 0x04000)  return "BLX";
+    if (fw_size == 0x3C000)  return "CCX";
+    if (fw_size == 0xC0000)  return "CDX";
+    if (fw_size == 0xFC000)  return "CMX";
+    if (fw_size == FULL_IMAGE_SIZE) return "FULL";
     return nullptr;
 }
 
@@ -655,7 +765,7 @@ void ResmedOta::start_flash(const char *block, size_t fw_size,
     if (!block || block[0] == '\0') {
         block = detect_block(fw_size);
         if (!block) {
-            strncpy(flash_error, "Cannot detect block for this file size", sizeof(flash_error));
+            strncpy(flash_error, "Cannot detect block: file size must exactly match BLX/CCX/CDX/CMX/FULL", sizeof(flash_error));
             return;
         }
     }
