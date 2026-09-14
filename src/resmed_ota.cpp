@@ -188,13 +188,13 @@ static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
     return false;
 }
 
-static bool send_bootloader_entry_no_wait() {
+static bool send_bootloader_entry_no_wait(uint32_t settle_ms) {
     uint8_t frame[QFRAME_MAX_RAW];
     int frame_len = qframe_build_cmd("P S #BLL 0001", frame, sizeof(frame));
     if (frame_len < 0) return false;
     Arbiter::clear_rx_frames();
     Arbiter::write_raw(frame, frame_len);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    if (settle_ms) vTaskDelay(pdMS_TO_TICKS(settle_ms));
     Arbiter::clear_rx_frames();
     return true;
 }
@@ -247,10 +247,25 @@ static bool extract_bls_from_frame(const qframe_t &rx, int *bls) {
     return true;
 }
 
-// Run the timing-critical S10 bootloader catch entirely on the ESP32.
-// This intentionally mirrors the old resmed_flash.py S10 flood method, but
-// removes PC/TCP/Wi-Fi latency from the critical reboot window.
-static bool catch_bootloader_local(int *caught_bls, uint32_t window_ms = 1500) {
+static void log_catch_frame(const qframe_t &rx, uint32_t elapsed_ms, int probe) {
+    char text[49] = {};
+    uint16_t n = min((uint16_t)rx.payload_len, (uint16_t)(sizeof(text) - 1));
+    for (uint16_t i = 0; i < n; i++) {
+        uint8_t c = rx.payload[i];
+        text[i] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
+    }
+    Log::logf(CAT_OTA, LOG_INFO,
+              "[OTA] Catch RX +%u ms probe=%d type=%c len=%u payload='%s'%s\n",
+              (unsigned)elapsed_ms, probe,
+              (rx.type >= 0x20 && rx.type <= 0x7E) ? (char)rx.type : '?',
+              (unsigned)rx.payload_len, text,
+              rx.payload_len > n ? "..." : "");
+}
+
+// Timing-sensitive S10 bootloader catch performed entirely on the ESP32.
+// Diagnostic mode logs every parsed response so we can distinguish a missed
+// timing window from parser/response-order problems without erasing anything.
+static bool catch_bootloader_local(int *caught_bls, uint32_t window_ms) {
     uint8_t bls_frame[64];
     int bls_len = qframe_build_cmd("G S #BLS", bls_frame, sizeof(bls_frame));
     if (bls_len <= 0) return false;
@@ -261,6 +276,7 @@ static bool catch_bootloader_local(int *caught_bls, uint32_t window_ms = 1500) {
 
     const uint32_t start = millis();
     int probes = 0;
+    int frames_seen = 0;
     int last_bls = -1;
 
     while ((millis() - start) < window_ms && !flash_cancel) {
@@ -272,6 +288,9 @@ static bool catch_bootloader_local(int *caught_bls, uint32_t window_ms = 1500) {
         while ((int32_t)(read_until - millis()) > 0) {
             qframe_t rx;
             if (!Arbiter::wait_frame(&rx, 5)) continue;
+            frames_seen++;
+            log_catch_frame(rx, millis() - start, probes);
+
             int bls = -1;
             if (extract_bls_from_frame(rx, &bls)) {
                 last_bls = bls;
@@ -288,8 +307,8 @@ static bool catch_bootloader_local(int *caught_bls, uint32_t window_ms = 1500) {
 
     if (caught_bls) *caught_bls = last_bls;
     Log::logf(CAT_OTA, LOG_WARN,
-              "[OTA] Local bootloader catch expired after %u ms (%d probes, last BLS=%d)\n",
-              (unsigned)(millis() - start), probes, last_bls);
+              "[OTA] Local catch expired after %u ms (%d probes, %d frames, last BLS=%d)\n",
+              (unsigned)(millis() - start), probes, frames_seen, last_bls);
     return false;
 }
 
@@ -395,33 +414,42 @@ static bool enter_bootloader(bool send_bll = true) {
         return false;
     }
 
-    for (int attempt = 0; attempt < 3 && !flash_cancel; attempt++) {
+    // Controlled diagnostic timing sweep.  Each profile changes only the delay
+    // between BLL and the first local BLS probe.  Erase/write remain hard-disabled.
+    static const uint16_t settle_ms[] = {10, 50, 150};
+    static const uint16_t window_ms[] = {700, 700, 900};
+    const int profile_count = sizeof(settle_ms) / sizeof(settle_ms[0]);
+
+    for (int attempt = 0; attempt < profile_count && !flash_cancel; attempt++) {
         Log::logf(CAT_OTA, LOG_INFO,
-                  "[OTA] Local bootloader catch attempt %d/3: sending BLL...\n",
-                  attempt + 1);
-        if (!send_bootloader_entry_no_wait()) {
+                  "[OTA] Timing profile %d/%d: BLL settle=%u ms, catch window=%u ms\n",
+                  attempt + 1, profile_count,
+                  (unsigned)settle_ms[attempt], (unsigned)window_ms[attempt]);
+
+        if (!send_bootloader_entry_no_wait(settle_ms[attempt])) {
             snprintf(flash_error, sizeof(flash_error), "Failed to send BLL command");
             return false;
         }
 
         int caught_bls = -1;
-        if (catch_bootloader_local(&caught_bls, 1500)) {
+        if (catch_bootloader_local(&caught_bls, window_ms[attempt])) {
             vTaskDelay(pdMS_TO_TICKS(100));
             char bid[32] = {};
             if (query_device_bid(bid, sizeof(bid), 500)) {
                 Log::logf(CAT_OTA, LOG_INFO,
-                          "[OTA] Bootloader caught locally (BLS=%d, BID=%s)\n",
-                          caught_bls, bid);
+                          "[OTA] Bootloader caught locally (BLS=%d, BID=%s, profile=%d)\n",
+                          caught_bls, bid, attempt + 1);
                 return true;
             }
             Log::logf(CAT_OTA, LOG_WARN,
-                      "[OTA] Local BLS caught bootloader but BID query failed\n");
+                      "[OTA] Local BLS caught bootloader but BID query failed (profile=%d)\n",
+                      attempt + 1);
         }
 
-        if (attempt < 2) vTaskDelay(pdMS_TO_TICKS(300));
+        if (attempt + 1 < profile_count) vTaskDelay(pdMS_TO_TICKS(400));
     }
 
-    snprintf(flash_error, sizeof(flash_error), "Failed to catch bootloader locally");
+    snprintf(flash_error, sizeof(flash_error), "Failed bootloader timing sweep");
     return false;
 }
 
