@@ -19,9 +19,70 @@ static TaskHandle_t tcp_task_handle = nullptr;
 #define TCP_TASK_PRIO   3
 #define TCP_LINE_MAX    512
 
+static const uint32_t TCP_CLIENT_STALE_TIMEOUT_MS = 3000;
+static const uint32_t TRANSPARENT_IDLE_TIMEOUT_MS = 120000;
+
 static char line_buf[TCP_LINE_MAX];
 static int line_pos = 0;
+static uint32_t client_last_activity = 0;
 
+
+static void activate_client(WiFiClient &newClient) {
+    client = newClient;
+    client.setNoDelay(true);
+    line_pos = 0;
+    client_last_activity = millis();
+    Log::logf(CAT_TCP, LOG_INFO, "[TCP] Client connected from %s\n",
+              client.remoteIP().toString().c_str());
+    client.printf("AirBridge %s\n", airbridge_version());
+}
+
+static void poll_main_client_accept() {
+    if (!server) return;
+
+    WiFiClient newClient = server->accept();
+    if (!newClient) return;
+
+    newClient.setNoDelay(true);
+
+    if (!client || !client.connected()) {
+        activate_client(newClient);
+        return;
+    }
+
+    // Never pre-empt an active transparent session.  It may be in the middle of
+    // a firmware transfer, so dropping it would be unsafe.
+    if (Arbiter::get_state() == SYS_TRANSPARENT) {
+        Log::logf(CAT_TCP, LOG_WARN,
+                  "[TCP] Rejected client from %s: transparent session already active\n",
+                  newClient.remoteIP().toString().c_str());
+        newClient.println("ERR: AirBridge TCP busy (transparent session active)");
+        newClient.stop();
+        return;
+    }
+
+    // Port 23 is intentionally single-client.  A stale client can otherwise
+    // remain connected indefinitely and cause a new resmed_flash.py connection
+    // to complete the TCP handshake at the network layer while AirBridge never
+    // accepts or services it.  Replace only clients that have been idle long
+    // enough to be considered stale.
+    if ((uint32_t)(millis() - client_last_activity) >= TCP_CLIENT_STALE_TIMEOUT_MS) {
+        Log::logf(CAT_TCP, LOG_WARN,
+                  "[TCP] Replacing stale client from %s with %s\n",
+                  client.remoteIP().toString().c_str(),
+                  newClient.remoteIP().toString().c_str());
+        client.stop();
+        activate_client(newClient);
+        return;
+    }
+
+    Log::logf(CAT_TCP, LOG_WARN,
+              "[TCP] Rejected additional client from %s: active client from %s\n",
+              newClient.remoteIP().toString().c_str(),
+              client.remoteIP().toString().c_str());
+    newClient.println("ERR: AirBridge TCP busy (another client is active)");
+    newClient.stop();
+}
 
 
 static void handle_line(const char *line) {
@@ -68,10 +129,10 @@ static void handle_transparent() {
         return;
     }
 
-    client.println("OK: entering transparent mode (idle timeout 5s)");
+    client.printf("OK: entering transparent mode (idle timeout %us)\n",
+                  (unsigned)(TRANSPARENT_IDLE_TIMEOUT_MS / 1000));
+    client.flush();
     Arbiter::enter_transparent(&client);
-
-    static const uint32_t TRANSPARENT_IDLE_TIMEOUT = 5000;
 
     while (client.connected() && Arbiter::get_state() == SYS_TRANSPARENT) {
         // TCP -> UART
@@ -80,13 +141,18 @@ static void handle_transparent() {
             int n = client.readBytes(buf, min(client.available(), (int)sizeof(buf)));
             if (n > 0) {
                 Arbiter::write_raw(buf, n);
+                client_last_activity = millis();
             }
         }
 
-        // Idle timeout: 5s since last activity in either direction
-        // TCP->UART tracked here, UART->TCP tracked by rx_task via transparent_last_activity
+        // UART->TCP activity is tracked by rx_task via transparent_last_activity.
+        // Use a long timeout so erase/program operations are not interrupted by
+        // the bridge merely because there is a quiet interval on the wire.
         uint32_t last = Arbiter::transparent_activity();
-        if (millis() - last > TRANSPARENT_IDLE_TIMEOUT) {
+        if (millis() - last > TRANSPARENT_IDLE_TIMEOUT_MS) {
+            Log::logf(CAT_TCP, LOG_WARN,
+                      "[TCP] Transparent session idle timeout after %us\n",
+                      (unsigned)(TRANSPARENT_IDLE_TIMEOUT_MS / 1000));
             break;
         }
 
@@ -94,6 +160,7 @@ static void handle_transparent() {
     }
 
     Arbiter::exit_transparent();
+    client_last_activity = millis();
     if (client.connected()) {
         client.println("OK: transparent mode exited");
     }
@@ -178,17 +245,10 @@ void TcpBridge::task(void *param) {
     Log::logf(CAT_TCP, LOG_INFO, "[TCP] Listening on port %d\n", cfg.tcp_port);
 
     while (true) {
-        if (!client || !client.connected()) {
-            WiFiClient newClient = server->accept();
-            if (newClient) {
-                client = newClient;
-                client.setNoDelay(true);
-                line_pos = 0;
-                Log::logf(CAT_TCP, LOG_INFO, "[TCP] Client connected from %s\n",
-                            client.remoteIP().toString().c_str());
-                client.printf("AirBridge %s\n", airbridge_version());
-            }
-        }
+        // Always accept pending connections so a second client gets an explicit
+        // busy response instead of sitting silently in the TCP listen backlog.
+        // A stale non-transparent client may be replaced after 3 seconds idle.
+        poll_main_client_accept();
 
         if (!client || !client.connected()) {
             poll_debug_clients();
@@ -197,9 +257,9 @@ void TcpBridge::task(void *param) {
             continue;
         }
 
-
         while (client.available()) {
             char c = client.read();
+            client_last_activity = millis();
 
             if (c == '\n' || c == '\r') {
                 if (line_pos > 0) {
@@ -227,5 +287,4 @@ void TcpBridge::init() {
     xTaskCreatePinnedToCore(TcpBridge::task, "tcp_srv", TCP_TASK_STACK,
                             nullptr, TCP_TASK_PRIO, &tcp_task_handle, 0);
 }
-
 
