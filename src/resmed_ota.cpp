@@ -190,6 +190,20 @@ static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
     return false;
 }
 
+// resmed_flash.py treats the bootloader-entry command specially: write it,
+// wait 50 ms, then discard any reply instead of waiting for an R-frame.  The
+// bootloader window can be short, so waiting for the BLL response can miss it.
+static bool send_bootloader_entry_no_wait() {
+    uint8_t frame[QFRAME_MAX_RAW];
+    int frame_len = qframe_build_cmd("P S #BLL 0001", frame, sizeof(frame));
+    if (frame_len < 0) return false;
+    Arbiter::clear_rx_frames();
+    Arbiter::write_raw(frame, frame_len);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    Arbiter::clear_rx_frames();
+    return true;
+}
+
 static bool send_and_check(const char *cmd, char *resp, uint16_t resp_size,
                            uint16_t timeout_ms = 3000) {
     uint16_t len = resp_size;
@@ -310,7 +324,6 @@ static bool negotiate_best_baud() {
 }
 
 static bool enter_bootloader(bool send_bll = true) {
-    char resp[48] = {};
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
 
@@ -325,7 +338,10 @@ static bool enter_bootloader(bool send_bll = true) {
         }
 
         Log::logf(CAT_OTA, LOG_INFO, "[OTA] Triggering reboot...\n");
-        send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+        if (!send_bootloader_entry_no_wait()) {
+            snprintf(flash_error, sizeof(flash_error), "Failed to send BLL command");
+            return false;
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
@@ -345,7 +361,10 @@ static bool enter_bootloader(bool send_bll = true) {
             } else if (bls == 0 && send_bll) {
                 Log::logf(CAT_OTA, LOG_INFO,
                           "[OTA] BLS=0, re-sending BLL and allowing reboot time...\n");
-                send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+                if (!send_bootloader_entry_no_wait()) {
+                    snprintf(flash_error, sizeof(flash_error), "Failed to re-send BLL command");
+                    return false;
+                }
                 vTaskDelay(pdMS_TO_TICKS(300));
                 continue;
             }
@@ -412,8 +431,6 @@ static bool validate_flash_input(const esp_partition_t *part, const flash_params
     const bool full_upload = is_full_upload(p);
     const bool target_full = strcmp(p->block, "FULL") == 0;
 
-    // A full upload always contains the BLX BID, even when the requested target
-    // is only CCX/CDX/CMX. Match Python's cross-flash guard before slicing.
     if (full_upload) {
         char img_bid[32] = {};
         esp_partition_read(part, BID_OFFSET_SX577, img_bid, sizeof(img_bid) - 1);
@@ -450,8 +467,6 @@ static bool validate_flash_input(const esp_partition_t *part, const flash_params
     size_t part_offset = block_staging_offset(p, block);
     size_t data_size = block_data_size(p, block);
 
-    // Same rule as resmed_flash.py: a standalone block must be exactly the
-    // block size; a full image may be used as the source for any selected block.
     if (!full_upload && data_size != block->max_size) {
         snprintf(flash_error, sizeof(flash_error),
                  "%s image must be exactly %u bytes (got %u)",
@@ -460,8 +475,6 @@ static bool validate_flash_input(const esp_partition_t *part, const flash_params
     }
 
     if (strcmp(block->name, "CMX") == 0) {
-        // CMX contains CCX followed by CDX. Offsets differ depending on whether
-        // the source is a standalone CMX file or a 1 MiB full image.
         const size_t ccx_off = part_offset;
         const size_t cdx_off = part_offset + 0x3C000;
         if (!verify_block_crc(part, ccx_off, 0x3C000) ||
