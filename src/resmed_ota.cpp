@@ -195,7 +195,6 @@ static bool send_bootloader_entry_no_wait(uint32_t settle_ms) {
     Arbiter::clear_rx_frames();
     Arbiter::write_raw(frame, frame_len);
     if (settle_ms) vTaskDelay(pdMS_TO_TICKS(settle_ms));
-    Arbiter::clear_rx_frames();
     return true;
 }
 
@@ -255,60 +254,82 @@ static void log_catch_frame(const qframe_t &rx, uint32_t elapsed_ms, int probe) 
         text[i] = (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
     }
     Log::logf(CAT_OTA, LOG_INFO,
-              "[OTA] Catch RX +%u ms probe=%d type=%c len=%u payload='%s'%s\n",
+              "[OTA] Probe RX +%u ms probe=%d type=%c len=%u payload='%s'%s\n",
               (unsigned)elapsed_ms, probe,
               (rx.type >= 0x20 && rx.type <= 0x7E) ? (char)rx.type : '?',
               (unsigned)rx.payload_len, text,
               rx.payload_len > n ? "..." : "");
 }
 
-// Timing-sensitive S10 bootloader catch performed entirely on the ESP32.
-// Diagnostic mode logs every parsed response so we can distinguish a missed
-// timing window from parser/response-order problems without erasing anything.
-static bool catch_bootloader_local(int *caught_bls, uint32_t window_ms) {
+// Diagnostic-only single-shot probing after one BLL reboot command.  There is
+// deliberately no 0x55 flood and no repeated BLS hammering.  At each target
+// time we send exactly one G S #BLS frame, collect responses briefly, and log
+// what came back.  Erase/write remain hard-disabled by TEST_ONLY below.
+static bool probe_bootloader_single_shot(int *caught_bls) {
+    static const uint16_t probe_at_ms[] = {20, 50, 100, 200, 400, 800};
+    const int probe_count = sizeof(probe_at_ms) / sizeof(probe_at_ms[0]);
+
     uint8_t bls_frame[64];
     int bls_len = qframe_build_cmd("G S #BLS", bls_frame, sizeof(bls_frame));
     if (bls_len <= 0) return false;
 
-    uint8_t preamble[128];
-    memset(preamble, 0x55, sizeof(preamble));
     Arbiter::clear_rx_frames();
-
     const uint32_t start = millis();
-    int probes = 0;
-    int frames_seen = 0;
     int last_bls = -1;
 
-    while ((millis() - start) < window_ms && !flash_cancel) {
-        Arbiter::write_raw(preamble, sizeof(preamble));
+    for (int i = 0; i < probe_count && !flash_cancel; i++) {
+        while ((millis() - start) < probe_at_ms[i] && !flash_cancel) {
+            qframe_t stray;
+            if (Arbiter::wait_frame(&stray, 1)) {
+                log_catch_frame(stray, millis() - start, i);
+                int bls = -1;
+                if (extract_bls_from_frame(stray, &bls)) {
+                    last_bls = bls;
+                    if (bls >= 1) {
+                        if (caught_bls) *caught_bls = bls;
+                        return true;
+                    }
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
+
+        Arbiter::clear_rx_frames();
+        Log::logf(CAT_OTA, LOG_INFO,
+                  "[OTA] Single-shot BLS probe %d/%d at +%u ms\n",
+                  i + 1, probe_count, (unsigned)(millis() - start));
         Arbiter::write_raw(bls_frame, bls_len);
-        probes++;
 
         const uint32_t read_until = millis() + 35;
-        while ((int32_t)(read_until - millis()) > 0) {
+        bool saw_frame = false;
+        while ((int32_t)(read_until - millis()) > 0 && !flash_cancel) {
             qframe_t rx;
             if (!Arbiter::wait_frame(&rx, 5)) continue;
-            frames_seen++;
-            log_catch_frame(rx, millis() - start, probes);
-
+            saw_frame = true;
+            log_catch_frame(rx, millis() - start, i + 1);
             int bls = -1;
             if (extract_bls_from_frame(rx, &bls)) {
                 last_bls = bls;
                 Log::logf(CAT_OTA, LOG_INFO,
-                          "[OTA] Local BLS response: %d at +%u ms (probe %d)\n",
-                          bls, (unsigned)(millis() - start), probes);
+                          "[OTA] Single-shot BLS=%d at +%u ms (probe %d)\n",
+                          bls, (unsigned)(millis() - start), i + 1);
                 if (bls >= 1) {
                     if (caught_bls) *caught_bls = bls;
                     return true;
                 }
             }
         }
+        if (!saw_frame) {
+            Log::logf(CAT_OTA, LOG_INFO,
+                      "[OTA] Single-shot probe %d: no response in 35 ms\n", i + 1);
+        }
     }
 
     if (caught_bls) *caught_bls = last_bls;
     Log::logf(CAT_OTA, LOG_WARN,
-              "[OTA] Local catch expired after %u ms (%d probes, %d frames, last BLS=%d)\n",
-              (unsigned)(millis() - start), probes, frames_seen, last_bls);
+              "[OTA] Single-shot diagnostic complete; no bootloader BLS caught (last BLS=%d)\n",
+              last_bls);
     return false;
 }
 
@@ -414,42 +435,31 @@ static bool enter_bootloader(bool send_bll = true) {
         return false;
     }
 
-    // Controlled diagnostic timing sweep.  Each profile changes only the delay
-    // between BLL and the first local BLS probe.  Erase/write remain hard-disabled.
-    static const uint16_t settle_ms[] = {10, 50, 150};
-    static const uint16_t window_ms[] = {700, 700, 900};
-    const int profile_count = sizeof(settle_ms) / sizeof(settle_ms[0]);
+    Log::logf(CAT_OTA, LOG_INFO,
+              "[OTA] Single-shot diagnostic: one BLL, no 0x55 flood, BLS at 20/50/100/200/400/800 ms\n");
 
-    for (int attempt = 0; attempt < profile_count && !flash_cancel; attempt++) {
-        Log::logf(CAT_OTA, LOG_INFO,
-                  "[OTA] Timing profile %d/%d: BLL settle=%u ms, catch window=%u ms\n",
-                  attempt + 1, profile_count,
-                  (unsigned)settle_ms[attempt], (unsigned)window_ms[attempt]);
-
-        if (!send_bootloader_entry_no_wait(settle_ms[attempt])) {
-            snprintf(flash_error, sizeof(flash_error), "Failed to send BLL command");
-            return false;
-        }
-
-        int caught_bls = -1;
-        if (catch_bootloader_local(&caught_bls, window_ms[attempt])) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            char bid[32] = {};
-            if (query_device_bid(bid, sizeof(bid), 500)) {
-                Log::logf(CAT_OTA, LOG_INFO,
-                          "[OTA] Bootloader caught locally (BLS=%d, BID=%s, profile=%d)\n",
-                          caught_bls, bid, attempt + 1);
-                return true;
-            }
-            Log::logf(CAT_OTA, LOG_WARN,
-                      "[OTA] Local BLS caught bootloader but BID query failed (profile=%d)\n",
-                      attempt + 1);
-        }
-
-        if (attempt + 1 < profile_count) vTaskDelay(pdMS_TO_TICKS(400));
+    // Do not clear the BLL ACK after the write; the single-shot diagnostic logs
+    // it as part of the observed reboot sequence.
+    if (!send_bootloader_entry_no_wait(0)) {
+        snprintf(flash_error, sizeof(flash_error), "Failed to send BLL command");
+        return false;
     }
 
-    snprintf(flash_error, sizeof(flash_error), "Failed bootloader timing sweep");
+    int caught_bls = -1;
+    if (probe_bootloader_single_shot(&caught_bls)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        char bid[32] = {};
+        if (query_device_bid(bid, sizeof(bid), 500)) {
+            Log::logf(CAT_OTA, LOG_INFO,
+                      "[OTA] Bootloader caught by single-shot probe (BLS=%d, BID=%s)\n",
+                      caught_bls, bid);
+            return true;
+        }
+        Log::logf(CAT_OTA, LOG_WARN,
+                  "[OTA] BLS indicated bootloader but BID query failed\n");
+    }
+
+    snprintf(flash_error, sizeof(flash_error), "Single-shot bootloader diagnostic did not catch BLS>=1");
     return false;
 }
 
