@@ -254,8 +254,9 @@ static bool enter_bootloader(bool send_bll = true) {
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
 
+    // Match current resmed_flash.py timing: allow quiet time around BLL and
+    // use a 300 ms BLS response window instead of hammering the device.
     if (send_bll) {
-        // Check if already in bootloader
         if (send_raw_cmd("G S #BLS", resp, sizeof(resp), 300)) {
             const char *bv = qframe_response_value(resp);
             if (bv && strtol(bv, nullptr, 16) >= 1) {
@@ -263,37 +264,39 @@ static bool enter_bootloader(bool send_bll = true) {
                 return true;
             }
         }
+
         Log::logf(CAT_OTA, LOG_INFO, "[OTA] Triggering reboot...\n");
         send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-
-    int bls0_count = 0;
-    for (int i = 0; i < 100 && !flash_cancel; i++) {
+    for (int i = 0; i < 60 && !flash_cancel; i++) {
         memset(resp, 0, sizeof(resp));
-        bool got = send_raw_cmd("G S #BLS", resp, sizeof(resp), 100);
+        bool got = send_raw_cmd("G S #BLS", resp, sizeof(resp), 300);
+
         if (got) {
             const char *bv = qframe_response_value(resp);
             if (bv) {
                 int bls = (int)strtol(bv, nullptr, 16);
                 if (bls >= 1) {
-                    Log::logf(CAT_OTA, LOG_INFO, "[OTA] In bootloader (BLS=%d) after %d polls\n", bls, i);
+                    Log::logf(CAT_OTA, LOG_INFO,
+                              "[OTA] In bootloader (BLS=%d) after %d polls\n", bls, i);
                     return true;
                 }
-                // BLS=0: app is running; send BLL to reboot into bootloader
-                bls0_count++;
-                Log::logf(CAT_OTA, LOG_DEBUG, "[OTA] BLS poll %d: app running (BLS=0)\n", i);
-                if (bls0_count >= 3) {
-                    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Sending BLL...\n");
+
+                if (bls == 0 && send_bll) {
+                    Log::logf(CAT_OTA, LOG_INFO,
+                              "[OTA] BLS=0, re-sending BLL and allowing reboot time...\n");
                     send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
-                    bls0_count = 0;
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    continue;
                 }
             }
-        } else {
-            // No response; device resetting? keep polling fast
-            bls0_count = 0;
-            if (i < 3 || i % 20 == 0) Log::logf(CAT_OTA, LOG_DEBUG, "[OTA] BLS poll %d: no response\n", i);
+        } else if (i < 3 || i % 10 == 0) {
+            Log::logf(CAT_OTA, LOG_DEBUG,
+                      "[OTA] BLS poll %d: no response\n", i);
         }
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
